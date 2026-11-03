@@ -14,6 +14,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.util.Base64
 import android.util.Log
 import android.view.View
 import android.view.WindowManager
@@ -21,11 +22,24 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
+import okio.ByteString.Companion.encodeUtf8
+import okio.ByteString.Companion.toByteString
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 import kotlin.math.sqrt
 
 /**
@@ -48,6 +62,12 @@ class MainActivity : Activity() {
         private const val REQ_RECORD_AUDIO = 100
         private const val TTS_UTTER_ID = "diag_tts"
         private const val TEST_A_DURATION_MS = 10_000L
+
+        // Test E：讯飞实时转写（联调临时决策：用户确认密钥入 APK；正式发布版必须移除并改走服务端代理）
+        private const val XF_APP_ID = "6eb32081"
+        private const val XF_API_KEY = "9f15c5590c9bcb7ed781a8a6a4f61281"
+        private const val XF_WS_URL = "wss://rtasr.xfyun.cn/v1/ws"
+        private const val E_DURATION_MS = 15_000L
 
         private val STABILITY_OPTIONS = longArrayOf(2, 5, 10, 30)
     }
@@ -88,6 +108,12 @@ class MainActivity : Activity() {
             }
         }
     }
+
+    // Test E：讯飞实时转写状态
+    private var ws: WebSocket? = null
+    private var wsClient: OkHttpClient? = null
+    @Volatile private var eRunning = false
+    private var eStopPosted = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -146,6 +172,11 @@ class MainActivity : Activity() {
             }, lp(1f))
         }
         root.addView(row3)
+
+        val row4 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row4.addView(btn("E 讯飞转写") { runTestE() }, lp(1f))
+        row4.addView(btn("E 立即结束") { stopTestE("用户手动结束") }, lp(1f))
+        root.addView(row4)
 
         setContentView(root)
     }
@@ -231,7 +262,7 @@ class MainActivity : Activity() {
         else "未取到路由设备"
     }
 
-    private fun startRecording(tag: String, saveToFile: Boolean): Boolean {
+    private fun startRecording(tag: String, saveToFile: Boolean, onFrame: ((ByteArray, Int) -> Unit)? = null): Boolean {
         if (!hasMicPermission()) {
             log("[$tag] 无麦克风权限，终止")
             return false
@@ -280,6 +311,7 @@ class MainActivity : Activity() {
                         lastRms = sqrt(sum / (n / 2))
                     }
                     stream?.write(buf, 0, n)
+                    onFrame?.invoke(buf, n)
                 } else if (n < 0) {
                     readErrors++
                     log("[$tag] read 返回错误码 $n（累计 $readErrors 次）")
@@ -444,6 +476,107 @@ class MainActivity : Activity() {
         handler.post(stabilityTick)
     }
 
+    // ---------- Test E：讯飞实时转写 ----------
+    private fun xfSigna(ts: String): String {
+        val md5 = MessageDigest.getInstance("MD5").digest((XF_APP_ID + ts).toByteArray(Charsets.UTF_8))
+        val md5Hex = md5.joinToString("") { "%02x".format(it) }
+        val mac = Mac.getInstance("HmacSHA1")
+        mac.init(SecretKeySpec(XF_API_KEY.toByteArray(Charsets.UTF_8), "HmacSHA1"))
+        val sig = mac.doFinal(md5Hex.toByteArray(Charsets.UTF_8))
+        return Base64.encodeToString(sig, Base64.NO_WRAP)
+    }
+
+    private fun runTestE() {
+        if (eRunning) {
+            log("Test E 已在运行中，忽略重复启动")
+            return
+        }
+        if (!startRecording("TestE", saveToFile = false, onFrame = { buf, n ->
+            ws?.send(buf.copyOfRange(0, n).toByteString())
+        })) return
+        eRunning = true
+        eStopPosted = false
+        status("Test E 讯飞转写中 15s…")
+        val ts = (System.currentTimeMillis() / 1000).toString()
+        val signa = xfSigna(ts)
+        val url = "$XF_WS_URL?appid=$XF_APP_ID&ts=$ts&signa=$signa&roleType=2"
+        log("Test E 连接讯飞 RTASR…（roleType=2 说话人分离）")
+        val client = OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(0, TimeUnit.MILLISECONDS)
+            .build()
+        wsClient = client
+        val req = Request.Builder().url(url).build()
+        ws = client.newWebSocket(req, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                log("Test E WS 连接成功，开始推流")
+            }
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                handleXfMessage(bytes.utf8())
+            }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                log("Test E WS 失败: ${t.message}")
+            }
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                log("Test E WS 关闭中 code=$code reason=$reason")
+            }
+        })
+        handler.postDelayed({ stopTestE("TestE 15s 自动结束") }, E_DURATION_MS)
+    }
+
+    private fun stopTestE(reason: String) {
+        if (!eRunning) {
+            log("Test E 未在运行")
+            return
+        }
+        if (eStopPosted) return
+        eStopPosted = true
+        log("Test E 结束: $reason，发送 end 帧…")
+        ws?.send("{\"end\":true}".encodeUtf8())
+        ws?.close(1000, "diag end")
+        ws = null
+        wsClient?.dispatcher?.executorService?.shutdown()
+        wsClient = null
+        stopRecording(reason)
+        eRunning = false
+        status("Test E 完成")
+    }
+
+    private fun handleXfMessage(json: String) {
+        try {
+            val root = JSONObject(json)
+            when (root.optString("action")) {
+                "started" -> log("Test E 讯飞开始识别 code=${root.optInt("code")}")
+                "result" -> {
+                    val data = root.optJSONObject("data") ?: return
+                    val cn = data.optJSONObject("cn") ?: return
+                    val st = cn.optJSONObject("st") ?: return
+                    val rt = st.optJSONArray("rt") ?: return
+                    for (i in 0 until rt.length()) {
+                        val seg = rt.getJSONObject(i)
+                        val speaker = seg.optInt("speaker", -1)
+                        val wsArr = seg.optJSONArray("ws") ?: continue
+                        val sb = StringBuilder()
+                        for (j in 0 until wsArr.length()) {
+                            val w = wsArr.getJSONObject(j)
+                            val cw = w.optJSONArray("cw") ?: continue
+                            if (cw.length() > 0) sb.append(cw.getJSONObject(0).optString("w", ""))
+                        }
+                        if (sb.isNotEmpty()) {
+                            val who = when (speaker) { 0 -> "面试官"; 1 -> "候选人"; else -> "?" }
+                            log("Test E [$who] $sb")
+                        }
+                    }
+                }
+                "error" -> log("Test E 讯飞错误 code=${root.optInt("code")} msg=${root.optString("msg")}（10115 不重连）")
+                else -> log("Test E 未知消息: $json")
+            }
+        } catch (e: Exception) {
+            log("Test E 解析消息失败: ${e.message}")
+        }
+    }
+
     // ---------- 生命周期 ----------
     override fun onPause() {
         super.onPause()
@@ -457,6 +590,9 @@ class MainActivity : Activity() {
         super.onDestroy()
         recording = false
         handler.removeCallbacksAndMessages(null)
+        eRunning = false
+        try { ws?.close(1000, "onDestroy") } catch (_: Exception) {}
+        wsClient?.dispatcher?.executorService?.shutdown()
         tts?.stop()
         tts?.shutdown()
         tts = null

@@ -3,6 +3,8 @@
 
     <!-- Test A/C/D：麦克风录音 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Test E：讯飞实时转写（WebSocket 网络访问） -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <!-- Test B：声明对系统 TTS 引擎的可见性（targetSdk 34+ 包可见性限制，
          缺此声明会导致 bind TTS 引擎被拒、TextToSpeech 初始化 status=-1） -->
