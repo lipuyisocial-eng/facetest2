@@ -531,6 +531,8 @@ class MainActivity : Activity() {
                             }
                             ws.send("{\"end\":true}".encodeUtf8())
                             log("OkHttp 推流完成 ${off}B（${sendFrames} 帧），end 已发")
+                            Thread.sleep(500) // 等服务端处理
+                            ws.close(1000, "done") // 必须主动关闭，否则会话悬挂占用并发导致 10800
                         }.apply { isDaemon = true; name = "okhttp-push" }.start()
                     }
                     override fun onMessage(ws: WebSocket, text: String) { handleXfMessage(text) }
