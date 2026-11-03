@@ -354,12 +354,14 @@ class MainActivity : Activity() {
             .setBufferSizeInBytes(data.size.coerceAtLeast(4096))
             .setTransferMode(AudioTrack.MODE_STATIC)
             .build()
+        track.write(data, 0, data.size)
+        // MODE_STATIC：build 后 state=STATE_NO_STATIC_DATA(2)，write 数据后才变 STATE_INITIALIZED(1)；
+        // 初始化检查必须放在 write 之后，否则会误判跳过回放
         if (track.state != AudioTrack.STATE_INITIALIZED) {
-            log("Test A AudioTrack 初始化失败 state=${track.state}")
+            log("Test A AudioTrack 初始化失败 state=${track.state}（MODE_STATIC write 后应为 1）")
             track.release()
             return
         }
-        track.write(data, 0, data.size)
         log("Test A 回放开始 → 请人工确认扬声器是否真实发声")
         track.play()
         val totalMs = data.size * 1000L / (SAMPLE_RATE * 2)
