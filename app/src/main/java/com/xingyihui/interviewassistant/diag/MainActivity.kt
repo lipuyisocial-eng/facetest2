@@ -347,7 +347,8 @@ class MainActivity : Activity() {
                 .build())
             .setAudioFormat(AudioFormat.Builder()
                 .setSampleRate(SAMPLE_RATE)
-                .setChannelMask(CHANNEL)
+                // 播放必须用输出声道掩码 CHANNEL_OUT_MONO；误用录音输入掩码 CHANNEL_IN_MONO(16) 会导致 build() 抛 UnsupportedOperationException
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                 .setEncoding(ENCODING)
                 .build())
             .setBufferSizeInBytes(data.size.coerceAtLeast(4096))
