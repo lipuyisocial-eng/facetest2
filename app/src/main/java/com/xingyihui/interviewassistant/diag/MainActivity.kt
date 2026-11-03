@@ -529,10 +529,8 @@ class MainActivity : Activity() {
         // 推文件模式（诊断用）：存在 push_file.pcm 时走文件推流，不走实时录音
         val pf = File(filesDir, "push_file.pcm")
         if (pf.exists()) {
-            // 对照实验（2026-11-04 01:36）：OkHttp 在手机端 00:36 唯一一次成功后再测全失败（账号/内容经 Mac 复推均正常），
-            // 怀疑 OkHttp writer 批量 flush 触发讯飞突发拒识；手写 WS 逐帧 write+flush 与 Mac 成功路径完全一致。
-            // useRawWs=true 走手写 WS，false 走 OkHttp，用于二分传输实现。
-            val useRawWs = true
+            // 对照实验（2026-11-04 06:16）：手写 WS 文件模式前台态零 result；改回 OkHttp（00:36 唯一成功实现）复测
+            val useRawWs = false
             if (useRawWs) {
                 log("Test E 推文件模式（手写 WS 对照）: ${pf.absolutePath} (${pf.length()}B) — 逐帧 write+flush")
                 try {
