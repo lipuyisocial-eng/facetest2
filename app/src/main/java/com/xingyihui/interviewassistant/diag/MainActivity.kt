@@ -11,6 +11,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import android.view.View
 import android.view.WindowManager
@@ -62,14 +64,31 @@ class MainActivity : Activity() {
         // 讯飞实时转写（RTASR）密钥 —— 用户确认内置 APK
         private const val XF_APP_ID = "6eb32081"
         private const val XF_API_KEY = "9f15c5590c9bcb7ed781a8a6a4f61281"
+
+        private val QUESTIONS = arrayOf(
+            "请先做个简短的自我介绍。",
+            "你的主要优点和缺点是什么？",
+            "为什么选择我们公司？",
+            "你的职业规划是怎样的？",
+            "为什么从上一家公司离职？",
+            "你期望的薪资是多少？",
+            "如何看待加班这件事？",
+            "如果和同事意见不合，你会怎么处理？"
+        )
     }
 
     private val handler = Handler(Looper.getMainLooper())
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     private lateinit var statusView: TextView
+    private lateinit var questionView: TextView
     private lateinit var resultView: TextView
     private lateinit var btnStart: TextView
+
+    // TTS 播题
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var questionIdx = 0
 
     // 录音
     private var audioRecord: AudioRecord? = null
@@ -128,6 +147,21 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, dp(10))
         }
 
+        val questionLabel = TextView(this).apply {
+            text = "当前题目"
+            textSize = 13f
+            setTextColor(0xFF8A8F9C.toInt())
+            setPadding(0, 0, 0, dp(6))
+        }
+
+        questionView = TextView(this).apply {
+            text = "点击开始，面试官将通过语音提问"
+            textSize = 16f
+            setTextColor(0xFF1A1D26.toInt())
+            setLineSpacing(0f, 1.3f)
+            setPadding(0, 0, 0, dp(14))
+        }
+
         val resultLabel = TextView(this).apply {
             text = "识别结果"
             textSize = 13f
@@ -136,7 +170,7 @@ class MainActivity : Activity() {
         }
 
         resultView = TextView(this).apply {
-            text = "点击下方按钮开始答题，你的回答将实时转为文字。"
+            text = "面试官语音提问后，你的回答将实时转为文字。"
             textSize = 15f
             setTextIsSelectable(true)
             setLineSpacing(0f, 1.35f)
@@ -165,6 +199,8 @@ class MainActivity : Activity() {
         root.addView(title)
         root.addView(subtitle)
         root.addView(statusView)
+        root.addView(questionLabel)
+        root.addView(questionView)
         root.addView(resultLabel)
         root.addView(scroll)
         root.addView(btnStart, btnLp)
@@ -187,7 +223,8 @@ class MainActivity : Activity() {
 
     private fun appendResult(text: String) {
         handler.post {
-            resultView.text = if (resultView.text.isEmpty() || resultView.text == "点击下方按钮开始答题，你的回答将实时转为文字。")
+            val placeholder = "面试官语音提问后，你的回答将实时转为文字。"
+            resultView.text = if (resultView.text.isEmpty() || resultView.text == placeholder)
                 text else resultView.text.toString() + text
             (resultView.parent as? ScrollView)?.fullScroll(View.FOCUS_DOWN)
         }
@@ -218,6 +255,44 @@ class MainActivity : Activity() {
                 status("麦克风权限被拒绝，无法录音转写")
             }
         }
+    }
+
+    // ---------- TTS 播题 ----------
+    private fun initTtsIfNeeded() {
+        if (ttsReady) return
+        log("初始化 TextToSpeech…")
+        tts = TextToSpeech(this) { status ->
+            handler.post {
+                if (status == TextToSpeech.SUCCESS) {
+                    ttsReady = true
+                    val lang = tts?.setLanguage(Locale.CHINA)
+                    log("TTS 初始化成功；setLanguage(zh_CN)=$lang")
+                } else {
+                    log("TTS 初始化失败 status=$status（检查系统 TTS 引擎与语音包）")
+                }
+            }
+        }
+    }
+
+    /** 播报当前题目（面试官提问）；未就绪则静默降级为仅显示文字 */
+    private fun speakQuestion() {
+        val idx = questionIdx
+        val q = QUESTIONS[idx % QUESTIONS.size]
+        handler.post { questionView.text = "第${idx % QUESTIONS.size + 1}题：$q" }
+        if (!ttsReady) {
+            log("TTS 未就绪，题目仅显示不播报")
+            return
+        }
+        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) { log("TTS 播题完成") }
+            override fun onError(utteranceId: String?) { log("TTS 播题错误") }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?, errorCode: Int) { log("TTS 播题错误 code=$errorCode") }
+        })
+        val res = tts?.speak(q, TextToSpeech.QUEUE_FLUSH, null, "question_$idx")
+        log("TTS speak 题目返回=$res")
+        questionIdx++
     }
 
     // ---------- 录音 ----------
@@ -338,6 +413,9 @@ class MainActivity : Activity() {
         setButtonRunning(true)
         // 前台服务保活：ColorOS 后台冻结会导致推流线程卡死
         try { startService(Intent(this, DiagService::class.java)) } catch (e: Exception) { log("前台服务启动失败: ${e.message}") }
+        // 面试官语音提问（TTS 播题），与录音同时进行（诊断版 Test C 已验证同时录播不冲突）
+        initTtsIfNeeded()
+        handler.postDelayed({ speakQuestion() }, 600)
 
         val ts = (System.currentTimeMillis() / 1000).toString()
         val signa = URLEncoder.encode(xfSigna(ts), "UTF-8") // signa 含 +/=/ 必须 URL 编码，否则 10110 illegal signa
@@ -391,6 +469,7 @@ class MainActivity : Activity() {
         log("结束转写: $reason")
         log("推流统计: sendFrames=$sendFrames sendBytes=$sendBytes（采集 ${recordBytes}B）最近帧 RMS=${"%.1f".format(lastRms)}")
         stopRecording(reason)
+        try { tts?.stop() } catch (_: Exception) {}
         okWs?.send("{\"end\":true}".encodeUtf8())
         Thread.sleep(300) // 等 end 帧送达
         okWs?.close(1000, "done")
@@ -456,5 +535,7 @@ class MainActivity : Activity() {
         handler.removeCallbacksAndMessages(null)
         try { okWs?.close(1000, "destroy") } catch (_: Exception) {}
         okWs = null
+        try { tts?.stop(); tts?.shutdown() } catch (_: Exception) {}
+        tts = null
     }
 }
