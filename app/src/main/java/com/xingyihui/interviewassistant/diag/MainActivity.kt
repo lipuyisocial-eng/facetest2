@@ -190,6 +190,12 @@ class MainActivity : Activity() {
         root.addView(row4)
 
         setContentView(root)
+        // 锁屏无人值守自动测试开关：files/auto_e.flag 存在 → 启动 1.5s 后自动触发 Test E（真机锁屏下免 UI tap）
+        // 注：诊断专用；测试完成后删除 flag
+        if (File(filesDir, "auto_e.flag").exists()) {
+            log("检测到 auto_e.flag，1.5s 后自动触发 Test E")
+            handler.postDelayed({ runTestE() }, 1500)
+        }
     }
 
     private fun btn(label: String, onClick: () -> Unit) = Button(this).apply {
