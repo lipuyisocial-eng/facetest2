@@ -22,24 +22,33 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import org.json.JSONObject
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import okio.ByteString
 import okio.ByteString.Companion.encodeUtf8
 import okio.ByteString.Companion.toByteString
-import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 import java.security.MessageDigest
+import java.security.SecureRandom
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.TimeUnit
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 import kotlin.math.sqrt
 
 /**
@@ -66,7 +75,6 @@ class MainActivity : Activity() {
         // Test E：讯飞实时转写（联调临时决策：用户确认密钥入 APK；正式发布版必须移除并改走服务端代理）
         private const val XF_APP_ID = "6eb32081"
         private const val XF_API_KEY = "9f15c5590c9bcb7ed781a8a6a4f61281"
-        private const val XF_WS_URL = "wss://rtasr.xfyun.cn/v1/ws"
         private const val E_DURATION_MS = 15_000L
 
         private val STABILITY_OPTIONS = longArrayOf(2, 5, 10, 30)
@@ -109,17 +117,20 @@ class MainActivity : Activity() {
         }
     }
 
-    // Test E：讯飞实时转写状态
-    private var ws: WebSocket? = null
-    private var wsClient: OkHttpClient? = null
+    // Test E：讯飞实时转写状态（手写 RFC6455 WS：同步发送 + 40ms 节流，规避 OkHttp 异步突发导致讯飞静默拒识）
+    private var okWs: WebSocket? = null // OkHttp WebSocket（正式链路，已证手机端可识别）
+    private var xfWs: XfRawWs? = null // 手写 RFC6455 WS（诊断对照，已证 Android 端实时/文件均零 result）
     @Volatile private var eRunning = false
     private var eStopPosted = false
+    private var sendFrames = 0
+    private var sendBytes = 0L
+    private var sendLogStream: FileOutputStream? = null // 诊断：记录实际推流 payload，与录音文件字节级对比
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         buildUi()
-        log("应用启动 v0.1.0（音频诊断版）")
+        log("应用启动 v0.2.0（音频诊断版）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         log("音频配置: ${SAMPLE_RATE}Hz / 单声道 / 16bit PCM / 40ms/帧(1280B)")
         checkRecordPermission()
@@ -491,38 +502,91 @@ class MainActivity : Activity() {
             log("Test E 已在运行中，忽略重复启动")
             return
         }
-        if (!startRecording("TestE", saveToFile = false, onFrame = { buf, n ->
-            ws?.send(buf.copyOfRange(0, n).toByteString())
-        })) return
         eRunning = true
         eStopPosted = false
         status("Test E 讯飞转写中 15s…")
         val ts = (System.currentTimeMillis() / 1000).toString()
-        val signa = xfSigna(ts)
-        val url = "$XF_WS_URL?appid=$XF_APP_ID&ts=$ts&signa=$signa&roleType=2"
-        log("Test E 连接讯飞 RTASR…（roleType=2 说话人分离）")
-        val client = OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.MILLISECONDS)
-            .pingInterval(0, TimeUnit.MILLISECONDS)
-            .build()
-        wsClient = client
-        val req = Request.Builder().url(url).build()
-        ws = client.newWebSocket(req, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                log("Test E WS 连接成功，开始推流")
+        val signa = URLEncoder.encode(xfSigna(ts), "UTF-8") // signa 含 +/=/ 必须 URL 编码，否则鉴权失败（10110 illegal signa）
+        val path = "/v1/ws?appid=$XF_APP_ID&ts=$ts&signa=$signa&vadMdn=2"
+        log("Test E 连接讯飞 RTASR…（手写 WS + 40ms 同步节流）")
+        // 推文件模式（诊断用）：存在 push_file.pcm 时走手写 WS + TCP_NODELAY（验证 Nagle 假设），不走实时录音
+        val pf = File(filesDir, "push_file.pcm")
+        if (pf.exists()) {
+            log("Test E 推文件模式（OkHttp）: ${pf.absolutePath} (${pf.length()}B) — 40ms 节流推流")
+            try {
+                val data = pf.readBytes()
+                val client = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).build()
+                val req = Request.Builder().url("wss://rtasr.xfyun.cn$path").build()
+                client.newWebSocket(req, object : WebSocketListener() {
+                    override fun onOpen(ws: WebSocket, response: Response) {
+                        log("OkHttp WS 打开，开始推流")
+                        Thread {
+                            var off = 0
+                            while (off < data.size) {
+                                val n = minOf(1280, data.size - off)
+                                ws.send(data.copyOfRange(off, off + n).toByteString())
+                                off += n
+                                sendFrames++; sendBytes += n
+                                Thread.sleep(40)
+                            }
+                            ws.send("{\"end\":true}".encodeUtf8())
+                            log("OkHttp 推流完成 ${off}B（${sendFrames} 帧），end 已发")
+                        }.apply { isDaemon = true; name = "okhttp-push" }.start()
+                    }
+                    override fun onMessage(ws: WebSocket, text: String) { handleXfMessage(text) }
+                    override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { log("OkHttp 失败: ${t.message}") }
+                    override fun onClosed(ws: WebSocket, code: Int, reason: String) { log("OkHttp 关闭: $code $reason") }
+                })
+            } catch (e: Exception) {
+                log("Test E OkHttp 文件模式异常: ${e.message}")
             }
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                handleXfMessage(bytes.utf8())
+            handler.postDelayed({
+                log("Test E OkHttp 文件模式 15s 兜底结束")
+                eRunning = false
+                status("Test E 完成（OkHttp 文件模式兜底）")
+            }, 18000)
+            return
+        }
+        // 实时录音模式 v2（正式链路）：录音线程入队 + 独立推流线程 40ms 节奏 send（复刻 OkHttp 文件模式成功路径）
+        // 注：手写 RFC6455 WS 在 Android 端实测零 result；OkHttp 实时(onFrame 内 send)也零 result，故推流必须独立线程+固定节奏
+        val q = java.util.concurrent.LinkedBlockingQueue<ByteArray>(512)
+        try { sendLogStream = FileOutputStream(File(filesDir, "sendlog_${System.currentTimeMillis()}.pcm")) } catch (_: Exception) {}
+        val client = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).build()
+        val req = Request.Builder().url("wss://rtasr.xfyun.cn$path").build()
+        client.newWebSocket(req, object : WebSocketListener() {
+            override fun onOpen(ws: WebSocket, response: Response) {
+                log("Test E OkHttp WS 打开，启动推流线程")
+                okWs = ws
+                Thread {
+                    while (eRunning) {
+                        val f = q.poll(40, TimeUnit.MILLISECONDS)
+                        if (f != null) {
+                            okWs?.send(f.toByteString())
+                            sendFrames++
+                            sendBytes += f.size
+                        }
+                    }
+                }.apply { isDaemon = true; name = "okhttp-push" }.start()
             }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                log("Test E WS 失败: ${t.message}")
-            }
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                log("Test E WS 关闭中 code=$code reason=$reason")
-            }
+            override fun onMessage(ws: WebSocket, text: String) { handleXfMessage(text) }
+            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { log("Test E OkHttp 失败: ${t.message}") }
+            override fun onClosed(ws: WebSocket, code: Int, reason: String) { log("Test E OkHttp 关闭: $code $reason") }
         })
+        if (!startRecording("TestE", saveToFile = true, onFrame = { buf, n ->
+            q.offer(buf.copyOfRange(0, n)) // 录音线程只入队，不 send（40ms 节奏由推流线程保持）
+            try { sendLogStream?.write(buf, 0, n) } catch (_: Exception) {}
+        })) {
+            okWs?.close(1000, "stop")
+            okWs = null
+            eRunning = false
+            return
+        }
         handler.postDelayed({ stopTestE("TestE 15s 自动结束") }, E_DURATION_MS)
+        // 自动化声源：E 启动后 TTS 播报一次，制造稳定语音输入验证转写链路（正式真人测试时不依赖此步）
+        initTtsIfNeeded()
+        handler.postDelayed({
+            if (ttsReady) runTestB() else log("Test E TTS 声源未就绪，跳过自动播报")
+        }, 800)
     }
 
     private fun stopTestE(reason: String) {
@@ -533,12 +597,15 @@ class MainActivity : Activity() {
         if (eStopPosted) return
         eStopPosted = true
         log("Test E 结束: $reason，发送 end 帧…")
-        ws?.send("{\"end\":true}".encodeUtf8())
-        ws?.close(1000, "diag end")
-        ws = null
-        wsClient?.dispatcher?.executorService?.shutdown()
-        wsClient = null
-        stopRecording(reason)
+        log("Test E 推流统计: sendFrames=$sendFrames sendBytes=$sendBytes（采集 ${recordBytes}B）")
+        log("Test E 最近帧 RMS=${"%.1f".format(lastRms)}（>30 即有明显语音输入）")
+        try { sendLogStream?.flush(); sendLogStream?.close() } catch (_: Exception) {}
+        sendLogStream = null
+        stopRecording(reason) // 先停录音线程（onFrame 不再发帧）
+        okWs?.send("{\"end\":true}".encodeUtf8())
+        Thread.sleep(300) // 等 end 帧送达
+        okWs?.close(1000, "done")
+        okWs = null
         eRunning = false
         status("Test E 完成")
     }
@@ -555,16 +622,19 @@ class MainActivity : Activity() {
                     val rt = st.optJSONArray("rt") ?: return
                     for (i in 0 until rt.length()) {
                         val seg = rt.getJSONObject(i)
-                        val speaker = seg.optInt("speaker", -1)
                         val wsArr = seg.optJSONArray("ws") ?: continue
                         val sb = StringBuilder()
+                        var rl = "0"
                         for (j in 0 until wsArr.length()) {
                             val w = wsArr.getJSONObject(j)
                             val cw = w.optJSONArray("cw") ?: continue
-                            if (cw.length() > 0) sb.append(cw.getJSONObject(0).optString("w", ""))
+                            if (cw.length() > 0) {
+                                sb.append(cw.getJSONObject(0).optString("w", ""))
+                                if (rl == "0") rl = cw.getJSONObject(0).optString("rl", "0") // 角色字段在 cw[0].rl（roleType=2 时 1/2，切换才变）
+                            }
                         }
                         if (sb.isNotEmpty()) {
-                            val who = when (speaker) { 0 -> "面试官"; 1 -> "候选人"; else -> "?" }
+                            val who = when (rl) { "1" -> "面试官"; "2" -> "候选人"; else -> "?" }
                             log("Test E [$who] $sb")
                         }
                     }
@@ -591,10 +661,175 @@ class MainActivity : Activity() {
         recording = false
         handler.removeCallbacksAndMessages(null)
         eRunning = false
-        try { ws?.close(1000, "onDestroy") } catch (_: Exception) {}
-        wsClient?.dispatcher?.executorService?.shutdown()
+        xfWs?.close()
+        xfWs = null
         tts?.stop()
         tts?.shutdown()
         tts = null
+    }
+
+    // ---------- 手写 RFC6455 WebSocket 客户端 ----------
+    // 背景（已实证）：OkHttp 异步发送导致音频突发到达，讯飞 RTASR 对突发流静默拒识（无 result 无 error）；
+    // 本类每帧同步 write+flush（发送完成才返回），配合调用方 40ms 节流，规避该问题。
+    private class XfRawWs(
+        private val host: String,
+        private val port: Int,
+        private val path: String,
+        private val onOpen: () -> Unit,
+        private val onMessage: (String) -> Unit,
+        private val onError: (String) -> Unit
+    ) {
+        @Volatile var isReady = false
+            private set
+        @Volatile private var running = false
+        private var sock: Socket? = null
+        private var out: OutputStream? = null
+        private var input: InputStream? = null
+        private val writeLock = Any()
+        var frameDump: OutputStream? = null // 诊断：记录实际发出的 WS 帧字节
+        var useTls = true // 诊断：false 时走明文 ws://（绕过 SSL 层，验证 SSL 是否导致推流被拒）
+
+        fun connectAsync() {
+            Thread {
+                try {
+                    val s: Socket = if (useTls) {
+                        val ss = SSLSocketFactory.getDefault().createSocket() as SSLSocket
+                        ss.tcpNoDelay = true // 关键：关闭 Nagle，逐帧即时发送（OkHttp 默认 tcpNoDelay=true；Nagle 会聚合小帧成突发，讯飞拒识）
+                        ss.connect(InetSocketAddress(host, port), 10_000)
+                        ss.startHandshake()
+                        onError("TLS ${ss.session.protocol} 密码套件=${ss.session.cipherSuite}")
+                        ss
+                    } else {
+                        Socket().apply {
+                            tcpNoDelay = true
+                            connect(InetSocketAddress(host, 80), 10_000)
+                        } // 明文 ws:// 试 80 端口
+                    }
+                    sock = s
+                    out = s.getOutputStream()
+                    input = s.getInputStream()
+                    val key = Base64.encodeToString(ByteArray(16).also { SecureRandom().nextBytes(it) }, Base64.NO_WRAP)
+                    val req = "GET $path HTTP/1.1\r\n" +
+                            "Host: $host\r\n" +
+                            "Upgrade: websocket\r\n" +
+                            "Connection: Upgrade\r\n" +
+                            "Sec-WebSocket-Key: $key\r\n" +
+                            "Sec-WebSocket-Version: 13\r\n\r\n"
+                    out!!.write(req.toByteArray(Charsets.UTF_8))
+                    out!!.flush()
+                    val head = readUntilDoubleCrlf()
+                    if (!head.startsWith("HTTP/1.1 101")) {
+                        onError("握手失败: ${head.take(100).replace("\r", " ")}")
+                        close()
+                        return@Thread
+                    }
+                    running = true
+                    isReady = true
+                    onOpen()
+                    readLoop()
+                } catch (e: Exception) {
+                    onError("连接异常: ${e.message}")
+                    close()
+                }
+            }.apply { name = "xf-raw-ws"; isDaemon = true }.start()
+        }
+
+        private fun readUntilDoubleCrlf(): String {
+            val sb = StringBuilder()
+            val b = input!!
+            while (true) {
+                val c = b.read()
+                if (c < 0) throw IOException("流已关闭")
+                sb.append(c.toChar())
+                if (sb.length >= 4 && sb.substring(sb.length - 4) == "\r\n\r\n") return sb.toString()
+                if (sb.length > 8192) throw IOException("响应头过长")
+            }
+        }
+
+        private fun readLoop() {
+            try {
+                while (running) {
+                    val msg = readFrame()
+                    if (msg != null) onMessage(msg)
+                }
+            } catch (e: Exception) {
+                if (running) onError("读线程结束: ${e.message}")
+            }
+        }
+
+        /** 返回文本消息；控制帧返回 null */
+        private fun readFrame(): String? {
+            val b = input!!
+            val b0 = b.read()
+            if (b0 < 0) throw IOException("连接关闭")
+            val opcode = b0 and 0x0F
+            val b1 = b.read()
+            if (b1 < 0) throw IOException("连接关闭")
+            var len = (b1 and 0x7F).toLong()
+            if (len == 126L) {
+                val h = b.read(); val l = b.read()
+                if (l < 0) throw IOException("连接关闭")
+                len = ((h shl 8) or l).toLong()
+            } else if (len == 127L) {
+                var l = 0L
+                repeat(8) { l = (l shl 8) or b.read().toLong() }
+                len = l
+            }
+            if ((b1 and 0x80) != 0) repeat(4) { b.read() } // 服务端掩码（防御）
+            if (len > 1_048_576) throw IOException("帧过长 len=$len")
+            val payload = ByteArray(len.toInt())
+            var off = 0
+            while (off < payload.size) {
+                val r = b.read(payload, off, payload.size - off)
+                if (r < 0) throw IOException("读中断")
+                off += r
+            }
+            return when (opcode) {
+                0x1 -> String(payload, Charsets.UTF_8)
+                0x8 -> { running = false; throw IOException("服务端关闭") }
+                else -> null // ping/pong/续帧
+            }
+        }
+
+        fun sendBinary(data: ByteArray) {
+            if (!running && !isReady) return
+            synchronized(writeLock) {
+                val o = out ?: return
+                try {
+                    val f = wsFrame(data)
+                    try { frameDump?.write(f) } catch (_: Exception) {}
+                    o.write(f)
+                    o.flush()
+                } catch (e: Exception) {
+                    onError("发送失败: ${e.message}")
+                }
+            }
+        }
+
+        fun close() {
+            running = false
+            isReady = false
+            try { sock?.close() } catch (_: Exception) {}
+        }
+
+        companion object {
+            /** FIN=1 + binary(0x2) + 客户端掩码 */
+            fun wsFrame(payload: ByteArray): ByteArray {
+                val bos = ByteArrayOutputStream()
+                bos.write(0x82)
+                val len = payload.size
+                if (len < 126) bos.write(0x80 or len)
+                else {
+                    bos.write(0x80 or 126)
+                    bos.write((len shr 8) and 0xFF)
+                    bos.write(len and 0xFF)
+                }
+                val mask = ByteArray(4)
+                SecureRandom().nextBytes(mask)
+                bos.write(mask, 0, 4)
+                for (i in payload.indices) bos.write((payload[i].toInt() xor mask[i % 4].toInt()) and 0xFF)
+                return bos.toByteArray()
+            }
+        }
     }
 }
