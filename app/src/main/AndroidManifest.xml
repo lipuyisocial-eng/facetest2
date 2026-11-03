@@ -4,6 +4,14 @@
     <!-- Test A/C/D：麦克风录音 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- Test B：声明对系统 TTS 引擎的可见性（targetSdk 34+ 包可见性限制，
+         缺此声明会导致 bind TTS 引擎被拒、TextToSpeech 初始化 status=-1） -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+
     <application
         android:label="面试博弈·音频诊断"
         android:allowBackup="false"
