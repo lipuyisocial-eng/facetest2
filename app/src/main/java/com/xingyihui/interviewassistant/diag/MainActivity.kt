@@ -2,6 +2,7 @@ package com.xingyihui.interviewassistant.diag
 
 import android.Manifest
 import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -129,6 +130,10 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // 锁屏下保持应用前台：避免 ColorOS 后台网络限制（实测：后台态 OkHttp/手写 WS 推流均零 result，
+        // 唯一一次成功 00:36 为前台态；setShowWhenLocked 让应用如闹钟般显示于锁屏之上，保持前台）
+        setShowWhenLocked(true)
+        setTurnScreenOn(true)
         buildUi()
         log("应用启动 v0.2.0（音频诊断版）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
@@ -511,48 +516,101 @@ class MainActivity : Activity() {
         eRunning = true
         eStopPosted = false
         status("Test E 讯飞转写中 15s…")
+        // 前台服务保活：ColorOS 锁屏/后台会冻结应用（CPU≈0 推流卡死），前台服务+通知规避
+        try {
+            startService(Intent(this, DiagService::class.java))
+        } catch (e: Exception) {
+            log("前台服务启动失败: ${e.message}（继续，可能被冻结）")
+        }
         val ts = (System.currentTimeMillis() / 1000).toString()
         val signa = URLEncoder.encode(xfSigna(ts), "UTF-8") // signa 含 +/=/ 必须 URL 编码，否则鉴权失败（10110 illegal signa）
         val path = "/v1/ws?appid=$XF_APP_ID&ts=$ts&signa=$signa&vadMdn=2"
         log("Test E 连接讯飞 RTASR…（手写 WS + 40ms 同步节流）")
-        // 推文件模式（诊断用）：存在 push_file.pcm 时走手写 WS + TCP_NODELAY（验证 Nagle 假设），不走实时录音
+        // 推文件模式（诊断用）：存在 push_file.pcm 时走文件推流，不走实时录音
         val pf = File(filesDir, "push_file.pcm")
         if (pf.exists()) {
-            log("Test E 推文件模式（OkHttp）: ${pf.absolutePath} (${pf.length()}B) — 40ms 节流推流")
-            try {
-                val data = pf.readBytes()
-                val client = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).build()
-                val req = Request.Builder().url("wss://rtasr.xfyun.cn$path").build()
-                client.newWebSocket(req, object : WebSocketListener() {
-                    override fun onOpen(ws: WebSocket, response: Response) {
-                        log("OkHttp WS 打开，开始推流")
-                        Thread {
+            // 对照实验（2026-11-04 01:36）：OkHttp 在手机端 00:36 唯一一次成功后再测全失败（账号/内容经 Mac 复推均正常），
+            // 怀疑 OkHttp writer 批量 flush 触发讯飞突发拒识；手写 WS 逐帧 write+flush 与 Mac 成功路径完全一致。
+            // useRawWs=true 走手写 WS，false 走 OkHttp，用于二分传输实现。
+            val useRawWs = true
+            if (useRawWs) {
+                log("Test E 推文件模式（手写 WS 对照）: ${pf.absolutePath} (${pf.length()}B) — 逐帧 write+flush")
+                try {
+                    val data = pf.readBytes()
+                    val rw = XfRawWs(
+                        "rtasr.xfyun.cn", 443, path,
+                        onOpen = { log("RawWs 打开，开始推流") },
+                        onMessage = { handleXfMessage(it) },
+                        onError = { log("RawWs: $it") }
+                    )
+                    rw.useTls = true
+                    rw.connectAsync()
+                    Thread {
+                        try {
+                            var wait = 0
+                            while (!rw.isReady && wait < 15000) { Thread.sleep(50); wait += 50 }
+                            if (!rw.isReady) { log("RawWs 连接超时"); return@Thread }
                             var off = 0
                             while (off < data.size) {
                                 val n = minOf(1280, data.size - off)
-                                ws.send(data.copyOfRange(off, off + n).toByteString())
+                                rw.sendBinary(data.copyOfRange(off, off + n))
                                 off += n
                                 sendFrames++; sendBytes += n
                                 Thread.sleep(40)
                             }
-                            ws.send("{\"end\":true}".encodeUtf8())
-                            log("OkHttp 推流完成 ${off}B（${sendFrames} 帧），end 已发")
-                            Thread.sleep(500) // 等服务端处理
-                            ws.close(1000, "done") // 必须主动关闭，否则会话悬挂占用并发导致 10800
-                        }.apply { isDaemon = true; name = "okhttp-push" }.start()
-                    }
-                    override fun onMessage(ws: WebSocket, text: String) { handleXfMessage(text) }
-                    override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { log("OkHttp 失败: ${t.message}") }
-                    override fun onClosed(ws: WebSocket, code: Int, reason: String) { log("OkHttp 关闭: $code $reason") }
-                })
-            } catch (e: Exception) {
-                log("Test E OkHttp 文件模式异常: ${e.message}")
+                            rw.sendBinary("{\"end\":true}".toByteArray())
+                            log("RawWs 推流完成 $off（${sendFrames} 帧），end 已发")
+                            Thread.sleep(500)
+                            rw.close()
+                        } catch (e: Exception) {
+                            log("RawWs 推流异常: ${e.message}")
+                        }
+                    }.apply { isDaemon = true; name = "rawws-push" }.start()
+                } catch (e: Exception) {
+                    log("Test E RawWs 文件模式异常: ${e.message}")
+                }
+                handler.postDelayed({
+                    log("Test E RawWs 文件模式 15s 兜底结束")
+                    eRunning = false
+                    status("Test E 完成（RawWs 兜底）")
+                }, 18000)
+            } else {
+                log("Test E 推文件模式（OkHttp）: ${pf.absolutePath} (${pf.length()}B) — 40ms 节流推流")
+                try {
+                    val data = pf.readBytes()
+                    val client = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).build()
+                    val req = Request.Builder().url("wss://rtasr.xfyun.cn$path").build()
+                    client.newWebSocket(req, object : WebSocketListener() {
+                        override fun onOpen(ws: WebSocket, response: Response) {
+                            log("OkHttp WS 打开，开始推流")
+                            Thread {
+                                var off = 0
+                                while (off < data.size) {
+                                    val n = minOf(1280, data.size - off)
+                                    ws.send(data.copyOfRange(off, off + n).toByteString())
+                                    off += n
+                                    sendFrames++; sendBytes += n
+                                    Thread.sleep(40)
+                                }
+                                ws.send("{\"end\":true}".encodeUtf8())
+                                log("OkHttp 推流完成 ${off}B（${sendFrames} 帧），end 已发")
+                                Thread.sleep(500) // 等服务端处理
+                                ws.close(1000, "done") // 必须主动关闭，否则会话悬挂占用并发导致 10800
+                            }.apply { isDaemon = true; name = "okhttp-push" }.start()
+                        }
+                        override fun onMessage(ws: WebSocket, text: String) { handleXfMessage(text) }
+                        override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { log("OkHttp 失败: ${t.message}") }
+                        override fun onClosed(ws: WebSocket, code: Int, reason: String) { log("OkHttp 关闭: $code $reason") }
+                    })
+                } catch (e: Exception) {
+                    log("Test E OkHttp 文件模式异常: ${e.message}")
+                }
+                handler.postDelayed({
+                    log("Test E OkHttp 文件模式 15s 兜底结束")
+                    eRunning = false
+                    status("Test E 完成（OkHttp 文件模式兜底）")
+                }, 18000)
             }
-            handler.postDelayed({
-                log("Test E OkHttp 文件模式 15s 兜底结束")
-                eRunning = false
-                status("Test E 完成（OkHttp 文件模式兜底）")
-            }, 18000)
             return
         }
         // 实时录音模式 v2（正式链路）：录音线程入队 + 独立推流线程 40ms 节奏 send（复刻 OkHttp 文件模式成功路径）
@@ -566,13 +624,16 @@ class MainActivity : Activity() {
                 log("Test E OkHttp WS 打开，启动推流线程")
                 okWs = ws
                 Thread {
+                    // 严格 40ms 节奏推流（与 OkHttp 文件模式 sleep(40) 完全一致；poll 改为非阻塞+sleep，
+                    // 避免 poll 语义在发送耗时下产生错位突发——讯飞对突发流静默拒识）
                     while (eRunning) {
-                        val f = q.poll(40, TimeUnit.MILLISECONDS)
+                        val f = q.poll()
                         if (f != null) {
                             okWs?.send(f.toByteString())
                             sendFrames++
                             sendBytes += f.size
                         }
+                        Thread.sleep(40)
                     }
                 }.apply { isDaemon = true; name = "okhttp-push" }.start()
             }
@@ -615,6 +676,7 @@ class MainActivity : Activity() {
         okWs?.close(1000, "done")
         okWs = null
         eRunning = false
+        stopService(Intent(this, DiagService::class.java)) // 停止前台服务保活
         status("Test E 完成")
     }
 

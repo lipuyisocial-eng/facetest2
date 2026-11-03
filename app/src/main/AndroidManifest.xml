@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Test E：讯飞实时转写（WebSocket 网络访问） -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 前台服务（Test E 防 ColorOS 后台冻结）：通知 + 麦克风类型（targetSdk 34 需 FOREGROUND_SERVICE_MICROPHONE） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Test B：声明对系统 TTS 引擎的可见性（targetSdk 34+ 包可见性限制，
          缺此声明会导致 bind TTS 引擎被拒、TextToSpeech 初始化 status=-1） -->
@@ -28,6 +32,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 前台服务：Test E 推流期间保活（ColorOS 锁屏/后台冻结实测：后台应用 CPU 冻结 0%，推流线程卡死） -->
+        <service
+            android:name=".DiagService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 
 </manifest>
