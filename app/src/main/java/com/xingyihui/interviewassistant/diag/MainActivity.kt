@@ -156,6 +156,12 @@ class MainActivity : Activity() {
     private val recentInterviewer = ArrayList<Pair<String, Long>>()
     private val recentSpoken = ArrayList<Pair<String, Long>>()
     private val assistBuffer = StringBuilder()
+    private var recordOnly = false
+    private var roleScore1 = 0f
+    private var roleScore2 = 0f
+    private var interviewerCluster = 0
+    private var manualForceInterviewer = false
+    private var mediaSession: android.media.session.MediaSession? = null
     private var dlgRef: AlertDialog? = null
 
     // TTS 播题
@@ -207,17 +213,44 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v3.1.0（停顿聚合 · 先判定问题再回答）")
+        log("应用启动 v3.2.0（声学说话人归属 · 耳机键兜底）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
+        try {
+            mediaSession = android.media.session.MediaSession(this, "interview-assistant").apply {
+                setCallback(object : android.media.session.MediaSession.Callback() {
+                    override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
+                        toggleForceInterviewer()
+                        return true
+                    }
+                    override fun onPlay() { toggleForceInterviewer() }
+                    override fun onPause() { toggleForceInterviewer() }
+                })
+                isActive = true
+            }
+            log("MediaSession 已激活（蓝牙耳机播放键可切换面试官/自动）")
+        } catch (e: Exception) {
+            log("MediaSession 注册失败: ${e.message}")
+        }
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
         checkRecordPermission()
         // 调试钩子：adb am start -e debug_question "问题" 可直接驱动「真人辅助」提问识别链路（仅 debug 包）
         if (BuildConfig.DEBUG) {
             try {
-                val filter = android.content.IntentFilter("com.xingyihui.DEBUG_TRANSCRIPT")
+                val filter = android.content.IntentFilter().apply {
+                    addAction("com.xingyihui.DEBUG_TRANSCRIPT")
+                    addAction("com.xingyihui.DEBUG_TTS")
+                }
                 registerReceiver(object : android.content.BroadcastReceiver() {
                     override fun onReceive(c: android.content.Context?, i: Intent?) {
+                        if (i?.action == "com.xingyihui.DEBUG_TTS") {
+                            val txt = i.getStringExtra("text").orEmpty()
+                            val pitch = i.getFloatExtra("pitch", 1.0f)
+                            tts?.setPitch(pitch)
+                            tts?.speak(txt, TextToSpeech.QUEUE_FLUSH, null, "dbg_tts")
+                            log("DEBUG TTS（pitch=$pitch）: $txt")
+                            return
+                        }
                         val t = i?.getStringExtra("text").orEmpty()
                         if (t.isNotBlank()) {
                             log("DEBUG 广播注入转写: $t")
@@ -269,6 +302,13 @@ class MainActivity : Activity() {
                         log("DEBUG OCR 异常: ${e.javaClass.simpleName} ${e.message}")
                     }
                 }.start()
+            }
+            intent?.getStringExtra("debug_record_only")?.let {
+                assistMode = true
+                recordOnly = true
+                refreshModeUi()
+                status("仅录音模式：不会生成也不会播报，两人对话录 30-60 秒后点停止")
+                log("DEBUG 仅录音模式开启（不生成/不播报）")
             }
             intent?.getStringExtra("debug_transcript")?.takeIf { it.isNotBlank() }?.let { t ->
                 handler.postDelayed({
@@ -635,6 +675,8 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
 过滤阈值：${String.format(Locale.US, "%.2f", Prefs.threshold(this))}
 最近识别：${lastRecognized.ifBlank { "（还没识别到文字）" }}
 最近话术：$lastStrategyStatus
+声学分簇：${"%.0f".format(SpeakerTracker.centerLow)}Hz / ${"%.0f".format(SpeakerTracker.centerHigh)}Hz（间距 ${"%.0f".format(SpeakerTracker.separation)}Hz，可信=${SpeakerTracker.confident}）
+面试官簇：$interviewerCluster（分数 ${roleScore1}/${roleScore2}，强制模式=$manualForceInterviewer）
 播报中标记：$adviceSpeaking　忽略次数：$ignoreCount
 最近忽略原因：${lastIgnoreReason.ifBlank { "无" }}
 最近播报：${speakStateView.text}
@@ -1182,6 +1224,21 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         lastRecognized = t
         if (assistMode) {
             val now = SystemClock.elapsedRealtime()
+            // 声学说话人归属（讯飞 rl 恒为 0，只能本地从 PCM 判定）
+            val spkLabel = SpeakerTracker.label(bg, ed)
+            log("声学判定: label=$spkLabel 簇=${"%.0f".format(SpeakerTracker.centerLow)}/${"%.0f".format(SpeakerTracker.centerHigh)} 间距=${"%.0f".format(SpeakerTracker.separation)} 可信=${SpeakerTracker.confident} 窗口=${bg}-${ed}ms")
+            if (spkLabel != 0) {
+                val qLike = isQuestionLike(t)
+                val delta = if (qLike) 1f else if (t.length >= 18) -1f else 0f
+                if (spkLabel == 1) roleScore1 += delta else roleScore2 += delta
+                val diff = roleScore1 - roleScore2
+                interviewerCluster = if (kotlin.math.abs(diff) >= 1.5f) (if (diff > 0) 1 else 2) else 0
+                log("说话人判定: 簇$spkLabel ${if (qLike) "问句" else "陈述"} → 面试官簇=$interviewerCluster (分数 ${roleScore1}/${roleScore2})")
+            }
+            if (!manualForceInterviewer && interviewerCluster != 0 && spkLabel != 0 && spkLabel != interviewerCluster) {
+                log("候选人说话（簇$spkLabel ≠ 面试官簇$interviewerCluster），不触发生成: $t")
+                return
+            }
             val nowMs = SystemClock.elapsedRealtime()
             val echoOfSpoken = recentSpoken.any { (txt, at) ->
                 nowMs - at < 15_000 && textSim(txt, t) >= 0.45
@@ -1230,6 +1287,10 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                 ignoreCount++
                 lastIgnoreReason = "冷却中"
                 log("忽略识别（冷却中）: $t")
+                return
+            }
+            if (recordOnly) {
+                log("仅录音模式：只记录不生成: $t")
                 return
             }
             if (t.length >= 3) {
@@ -1459,6 +1520,9 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                     stream?.write(buf, 0, n)
                     onFrame?.invoke(buf, n)
                     val rmsNow = lastRms
+                    try {
+                        SpeakerTracker.feed(SystemClock.elapsedRealtime() - recordStartElapsed, buf, n)
+                    } catch (_: Exception) {}
                     handler.post {
                         waveView.push(rmsNow)
                         if (!assistMode && transcribing && rmsNow > 900 &&
@@ -1600,6 +1664,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
             return
         }
         status("录音转写中…（最长 60s）")
+        SpeakerTracker.reset()
         if (!assistMode) {
             hasSpeech = false
             lastVoiceAt = 0L
@@ -2087,6 +2152,13 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         return hit.toDouble() / minOf(x.length, y.length)
     }
 
+    private fun isQuestionLike(t: String): Boolean {
+        if (t.endsWith("？") || t.endsWith("?")) return true
+        val kws = arrayOf("吗", "多少", "怎么", "为什么", "如何", "是否", "能不能", "有没有",
+            "哪", "几", "介绍", "说说", "讲讲", "谈谈", "聊聊", "评价", "看法", "举")
+        return kws.any { t.contains(it) }
+    }
+
     private fun markVoice() {
         lastVoiceAt = SystemClock.elapsedRealtime()
         hasSpeech = true
@@ -2351,6 +2423,23 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         }
     }
 
+    private fun toggleForceInterviewer() {
+        manualForceInterviewer = !manualForceInterviewer
+        status(if (manualForceInterviewer) "耳机键：已锁定「面试官说话」模式" else "耳机键：恢复自动判定")
+        log("耳机键切换(MediaSession): manualForceInterviewer=$manualForceInterviewer")
+    }
+
+    /** 耳机线控兜底：按播放暂停键切换「强制面试官模式 / 自动判定」 */
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
+        if (keyCode == android.view.KeyEvent.KEYCODE_HEADSETHOOK ||
+            keyCode == android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+            keyCode == android.view.KeyEvent.KEYCODE_MEDIA_NEXT) {
+            toggleForceInterviewer()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     // ---------- 生命周期 ----------
     override fun onPause() {
         super.onPause()
@@ -2368,6 +2457,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         handler.removeCallbacksAndMessages(null)
         try { okWs?.close(1000, "destroy") } catch (_: Exception) {}
         okWs = null
+        try { mediaSession?.isActive = false; mediaSession?.release() } catch (_: Exception) {}
         try { tts?.stop(); tts?.shutdown() } catch (_: Exception) {}
         tts = null
     }
