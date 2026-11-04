@@ -22,8 +22,8 @@ android {
         applicationId = "com.xingyihui.interviewassistant.diag"
         minSdk = 26
         targetSdk = 34
-        versionCode = 15
-        versionName = "2.4.0"
+        versionCode = 16
+        versionName = "2.5.0"
 
         buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepseekKey\"")
         buildConfigField("String", "XF_API_SECRET", "\"$xfApiSecret\"")

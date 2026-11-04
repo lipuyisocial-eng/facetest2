@@ -137,6 +137,10 @@ class MainActivity : Activity() {
     private var lastVoiceAt = 0L
     private var hasSpeech = false
     private var questionSpokenAt = 0L
+    private var candidateChars = 0
+    private var ttsEchoUntil = 0L
+    private var lastRecognized = ""
+    private var lastStrategyStatus = "未生成"
     private var dlgRef: AlertDialog? = null
 
     // TTS 播题
@@ -188,7 +192,7 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v2.4.0（追问1秒 · 自动续答 · 实战即时播报）")
+        log("应用启动 v2.5.0（真实回答才接话 · 诊断面板）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
@@ -583,6 +587,20 @@ class MainActivity : Activity() {
         log("切换模式: ${if (assistMode) "实战模式" else "练习模式"}")
     }
 
+    private fun buildDiagnostics(): String {
+        val mode = if (assistMode) "实战" else "练习"
+        return """
+模式：${mode}
+录音中：$recording　转写中：$transcribing
+TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" else "关"}
+内置知识库：${BuiltinKnowledge.topicCount()} 个主题　上传资料：${DocumentStore.list(this).size} 份
+过滤阈值：${String.format(Locale.US, "%.2f", Prefs.threshold(this))}
+最近识别：${lastRecognized.ifBlank { "（还没识别到文字）" }}
+最近话术：$lastStrategyStatus
+最近播报：${speakStateView.text}
+""".trim()
+    }
+
     private fun refreshUploadCard() {
         if (!::uploadInfo.isInitialized) return
         val n = DocumentStore.list(this).size
@@ -892,6 +910,13 @@ class MainActivity : Activity() {
             dlgRef?.dismiss()
             openDocs()
         })
+        box.addView(entry("诊断信息（排查没反应/没声音）") {
+            AlertDialog.Builder(this)
+                .setTitle("诊断信息")
+                .setMessage(buildDiagnostics())
+                .setPositiveButton("知道了", null)
+                .show()
+        })
         box.addView(entry("隐私说明") {
             AlertDialog.Builder(this)
                 .setTitle("隐私说明")
@@ -1089,6 +1114,10 @@ class MainActivity : Activity() {
             return
         }
         committedText.append(t)
+        candidateChars += t.length
+        hasSpeech = true
+        lastVoiceAt = SystemClock.elapsedRealtime()
+        lastRecognized = t
         if (assistMode) {
             if (t.length >= 3) {
                 log("实战模式识别到面试官说话: $t → 600ms 后生成话术")
@@ -1203,6 +1232,7 @@ class MainActivity : Activity() {
             }
             override fun onDone(utteranceId: String?) {
                 if (utteranceId?.startsWith("next_") == true) {
+                    ttsEchoUntil = SystemClock.elapsedRealtime() + 1500
                     if (!assistMode && !transcribing) {
                         log("下一题播报完成，自动开始新一轮回答")
                         handler.postDelayed({ startRoundAfterQuestion() }, 350)
@@ -1219,7 +1249,8 @@ class MainActivity : Activity() {
                 log("TTS 播题完成 @${ttsEndMs}ms")
                 // 练习模式：只提问，不自动生成/播报话术（答完再看参考）
                 questionSpokenAt = SystemClock.elapsedRealtime()
-                log("TTS 播题结束（练习模式：等用户回答）")
+                ttsEchoUntil = questionSpokenAt + 1500
+                log("TTS 播题结束（练习模式：等用户回答，回声屏蔽至 +1500ms）")
             }
             override fun onError(utteranceId: String?) { log("TTS 错误: $utteranceId") }
             @Deprecated("Deprecated in Java")
@@ -1303,7 +1334,8 @@ class MainActivity : Activity() {
                     val rmsNow = lastRms
                     handler.post {
                         waveView.push(rmsNow)
-                        if (!assistMode && transcribing && rmsNow > 600) markVoice()
+                        if (!assistMode && transcribing && rmsNow > 900 &&
+                            SystemClock.elapsedRealtime() > ttsEchoUntil) markVoice()
                     }
                 } else if (n < 0) {
                     log("录音 read 返回错误码 $n")
@@ -1444,6 +1476,7 @@ class MainActivity : Activity() {
         if (!assistMode) {
             hasSpeech = false
             lastVoiceAt = 0L
+            candidateChars = 0
             if (pendingNextQuestion != null) questionSpokenAt = SystemClock.elapsedRealtime()
             handler.removeCallbacks(silenceWatcher)
             handler.postDelayed(silenceWatcher, 500)
@@ -1655,7 +1688,7 @@ class MainActivity : Activity() {
                         if (newSentence) curBg = bg
                         curEd = ed
                         curSentence = text
-                        if (!assistMode) markVoice()
+                        lastRecognized = text
                         if (isFinal) {
                             commitSentence(curSentence, curBg, curEd)
                             curSentence = ""
@@ -1890,8 +1923,8 @@ class MainActivity : Activity() {
             if (!transcribing || assistMode) return
             val now = SystemClock.elapsedRealtime()
             if (questionSpokenAt > 0 && now - questionSpokenAt > 1500) {
-                if (hasSpeech && now - lastVoiceAt >= 1000) {
-                    log("静音 1.0s（最后人声 ${now - lastVoiceAt}ms 前），自动结束本轮回答")
+                if (hasSpeech && candidateChars >= 2 && now - lastVoiceAt >= 1200) {
+                    log("静音 1.2s（最后回答 ${now - lastVoiceAt}ms 前，已识别 ${candidateChars} 字），自动结束本轮回答")
                     stopTranscribe("静音自动结束")
                     return
                 }
@@ -1947,6 +1980,7 @@ class MainActivity : Activity() {
             handler.post {
                 if (job != strategyJob) return@post
                 if (advice.error.isNotEmpty()) {
+                    lastStrategyStatus = "失败: ${advice.error.take(60)}"
                     log("话术生成失败: ${advice.error}")
                     strategyView.text = "话术生成失败：${advice.error.take(60)}"
                     status("话术生成失败")
@@ -1963,6 +1997,7 @@ class MainActivity : Activity() {
                     nextCard.visibility = View.VISIBLE
                 }
                 status(if (assistMode) "收音中" else "答题中")
+                lastStrategyStatus = "已生成 ${advice.elapsedMs}ms"
                 val willSpeak = assistMode && Prefs.speakEnabled(this@MainActivity)
                 log("话术自动播报=$willSpeak（实战=$assistMode 设置开=${Prefs.speakEnabled(this@MainActivity)} TTS就绪=$ttsReady）")
                 if (willSpeak) speakStrategy(advice.opening)
@@ -2113,6 +2148,12 @@ class MainActivity : Activity() {
             assistMode = true
             refreshModeUi()
             onDebugQuestion(q)
+        }
+        intent.getStringExtra("debug_transcript")?.takeIf { it.isNotBlank() }?.let { t ->
+            assistMode = true
+            refreshModeUi()
+            log("DEBUG 注入转写(前台): $t")
+            commitSentence(t, 0L, 0L)
         }
     }
 
