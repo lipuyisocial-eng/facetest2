@@ -78,7 +78,7 @@ class MainActivity : Activity() {
         private const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
         private const val REQ_RECORD_AUDIO = 100
         private const val REQ_DOC = 200
-        private const val MAX_DURATION_MS = 60_000L // 单次答题上限：60s 自动结束（防异常悬挂）
+        private const val MAX_DURATION_MS = 30 * 60_000L // 单次收音上限 30 分钟（原 60s 过短，真实面试会被自动掐断）
 
         // 讯飞实时转写大模型（rtasr_llm，用户 2026-11-04 开通）—— APP_ID/API_KEY 内置 APK（控制台 rtasr_llm 产品页 WebAPI 认证）；
         // API_SECRET 走 local.properties → BuildConfig（不入库，防密钥泄露；正式发布建议改服务端代理）
@@ -149,6 +149,7 @@ class MainActivity : Activity() {
     private var nextJob = 0
     private var ignoreCount = 0
     private var lastIgnoreReason = ""
+    private var lastStopReason = ""
     private var adviceStartAt = 0L
     private var adviceSafety: Runnable? = null
     private var lastSpokenText = ""
@@ -679,6 +680,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
 面试官簇：$interviewerCluster（分数 ${roleScore1}/${roleScore2}，强制模式=$manualForceInterviewer）
 播报中标记：$adviceSpeaking　忽略次数：$ignoreCount
 最近忽略原因：${lastIgnoreReason.ifBlank { "无" }}
+上次结束原因：${lastStopReason.ifBlank { "无" }}
 最近播报：${speakStateView.text}
 """.trim()
     }
@@ -1663,7 +1665,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
             setButtonRunning(false)
             return
         }
-        status("录音转写中…（最长 60s）")
+        status("录音转写中…（最长 30 分钟，可随时停止）")
         SpeakerTracker.reset()
         if (!assistMode) {
             hasSpeech = false
@@ -1680,13 +1682,14 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         handler.post { speakStateView.text = "" }
             handler.postDelayed(silenceWatcher, 500)
         }
-        handler.postDelayed({ if (transcribing) stopTranscribe("60s 上限自动结束") }, MAX_DURATION_MS)
+        handler.postDelayed({ if (transcribing) stopTranscribe("达到 30 分钟上限自动结束") }, MAX_DURATION_MS)
     }
 
     private fun stopTranscribe(reason: String) {
         if (!transcribing) return
         transcribing = false
         handler.removeCallbacks(silenceWatcher)
+        lastStopReason = reason
         log("结束转写: $reason")
         log("推流统计: sendFrames=$sendFrames sendBytes=$sendBytes（采集 ${recordBytes}B）最近帧 RMS=${"%.1f".format(lastRms)}")
         stopRecording(reason)
@@ -1706,7 +1709,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
             }
         }
         stopService(Intent(this, DiagService::class.java))
-        status("转写结束")
+        status("转写结束（$reason）")
         if (curSentence.isNotEmpty()) { commitSentence(curSentence, curBg, curEd); curSentence = "" }
         renderResult()
         Conversation.recordAnswer(resultText())
