@@ -66,10 +66,10 @@ class MainActivity : Activity() {
         private const val REQ_RECORD_AUDIO = 100
         private const val MAX_DURATION_MS = 60_000L // 单次答题上限：60s 自动结束（防异常悬挂）
 
-        // 讯飞实时转写大模型（rtasr_llm，用户 2026-11-04 开通）—— APP_ID/API_KEY 内置 APK；
+        // 讯飞实时转写大模型（rtasr_llm，用户 2026-11-04 开通）—— APP_ID/API_KEY 内置 APK（控制台 rtasr_llm 产品页 WebAPI 认证）；
         // API_SECRET 走 local.properties → BuildConfig（不入库，防密钥泄露；正式发布建议改服务端代理）
         private const val XF_APP_ID = "6eb32081"
-        private const val XF_API_KEY = "9f15c5590c9bcb7ed781a8a6a4f61281"
+        private const val XF_API_KEY = "876f9549559a4592a7fc8195fbbe343b"
         private const val XF_API_SECRET = BuildConfig.XF_API_SECRET
 
         // DeepSeek 回答反馈密钥 —— 用户提供（2026-11-04）；经 local.properties 注入 BuildConfig（不入库，防密钥泄露）；
@@ -641,14 +641,28 @@ class MainActivity : Activity() {
     private fun handleXfMessage(json: String) {
         try {
             val root = JSONObject(json)
-            when (root.optString("action")) {
-                "started" -> {
-                    log("讯飞开始识别 code=${root.optInt("code")}")
+            val data = root.optJSONObject("data")
+            val actionData = data?.optString("action") ?: ""
+            val actionTop = root.optString("action")
+            val msgType = root.optString("msg_type", "")
+            when {
+                actionData == "started" || actionTop == "started" -> {
+                    // rtasr_llm：started 在 data.action，且返回服务端 sessionId（结束帧必须用它）
+                    val sid = data?.optString("sessionId", "")
+                    if (!sid.isNullOrEmpty()) currentSessionId = sid
+                    log("讯飞开始识别 sessionId=$currentSessionId")
                     status("识别中…")
                 }
-                "result" -> {
-                    val data = root.optJSONObject("data") ?: return
-                    val cn = data.optJSONObject("cn") ?: return
+                actionData == "error" || actionTop == "error" -> {
+                    val desc = data?.optString("desc").orEmpty().ifEmpty { root.optString("desc") }
+                        .ifEmpty { root.optString("msg") }
+                    val code = data?.optInt("code", -1) ?: root.optInt("code", -1)
+                    log("讯飞错误 code=$code desc=$desc")
+                    status("讯飞错误: $desc")
+                }
+                msgType == "result" || actionTop == "result" -> {
+                    // rtasr_llm result 帧：msg_type=result，词在 data.cn.st.rt.ws.cw；经典协议为顶层 action=result
+                    val cn = data?.optJSONObject("cn") ?: return
                     val st = cn.optJSONObject("st") ?: return
                     val rt = st.optJSONArray("rt") ?: return
                     val sb = StringBuilder()
@@ -673,10 +687,6 @@ class MainActivity : Activity() {
                         log("讯飞识别: $sb (rl切换: ${rlSeen.trimEnd(',')})")
                         appendResult(sb.toString())
                     }
-                }
-                "error" -> {
-                    log("讯飞错误 code=${root.optInt("code")} msg=${root.optString("msg")}")
-                    status("讯飞错误: ${root.optString("msg")}")
                 }
             }
         } catch (e: Exception) {
