@@ -1,6 +1,16 @@
 package com.xingyihui.interviewassistant.diag
 
 import android.Manifest
+import android.app.AlertDialog
+import android.content.Context
+import android.content.res.ColorStateList
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.view.Gravity
+import android.widget.SeekBar
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -127,6 +137,17 @@ class MainActivity : Activity() {
     private lateinit var resultView: TextView
     private lateinit var feedbackView: TextView
     private lateinit var btnStart: TextView
+    private lateinit var strategyView: TextView
+    private lateinit var nextView: TextView
+    private lateinit var modeChip: TextView
+    private lateinit var speakStateView: TextView
+    private lateinit var chipsRow: LinearLayout
+    private lateinit var transcriptCard: LinearLayout
+    private lateinit var nextCard: LinearLayout
+    private lateinit var hintCard: LinearLayout
+    private lateinit var feedbackCard: LinearLayout
+    private lateinit var waveView: WaveView
+    private var assistMode = false
 
     // TTS 播题
     private var tts: TextToSpeech? = null
@@ -167,128 +188,401 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.statusBarColor = 0xFFF4F1EC.toInt()
+        window.navigationBarColor = 0xFFF4F1EC.toInt()
+        @Suppress("DEPRECATION")
+        window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or
+            View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
         // 转写期间保持应用前台：避免 ColorOS 后台网络限制（实测：后台态推流零 result）
         setShowWhenLocked(true)
         setTurnScreenOn(true)
+        assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v1.4.1（正式版·实时转写·知识库）")
+        log("应用启动 v1.5.0（HUD 界面 · 实时话术 · 语音播报）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         loadCorpus()
+        initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
         checkRecordPermission()
+        // 调试钩子：adb am start -e debug_question "问题" 可直接驱动「真人辅助」提问识别链路（仅 debug 包）
+        if (BuildConfig.DEBUG) {
+            intent?.getStringExtra("debug_question")?.takeIf { it.isNotBlank() }?.let { q ->
+                handler.postDelayed({
+                    assistMode = true
+                    refreshModeUi()
+                    onDebugQuestion(q)
+                }, 1200)
+            }
+        }
     }
 
-    // ---------- UI ----------
-    private fun buildUi() {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(20), dp(16), dp(20))
-            setBackgroundColor(0xFFF5F6FA.toInt())
-        }
-
-        val title = TextView(this).apply {
-            text = "面试博弈助手"
-            textSize = 24f
-            setTextColor(0xFF1A1D26.toInt())
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-        }
-        val subtitle = TextView(this).apply {
-            text = "实时语音转写 · 你说我记"
-            textSize = 13f
-            setTextColor(0xFF8A8F9C.toInt())
-            setPadding(0, dp(4), 0, dp(16))
-        }
-
-        statusView = TextView(this).apply {
-            text = "就绪"
-            textSize = 15f
-            setTextColor(0xFF3D4356.toInt())
-            setPadding(0, 0, 0, dp(10))
-        }
-
-        val questionLabel = TextView(this).apply {
-            text = "当前题目"
-            textSize = 13f
-            setTextColor(0xFF8A8F9C.toInt())
-            setPadding(0, 0, 0, dp(6))
-        }
-
-        questionView = TextView(this).apply {
-            text = "点击开始，面试官将通过语音提问"
-            textSize = 16f
-            setTextColor(0xFF1A1D26.toInt())
-            setLineSpacing(0f, 1.3f)
-            setPadding(0, 0, 0, dp(14))
-        }
-
-        val resultLabel = TextView(this).apply {
-            text = "识别结果"
-            textSize = 13f
-            setTextColor(0xFF8A8F9C.toInt())
-            setPadding(0, 0, 0, dp(6))
-        }
-
-        resultView = TextView(this).apply {
-            text = "面试官语音提问后，你的回答将实时转为文字。"
-            textSize = 15f
-            setTextIsSelectable(true)
-            setLineSpacing(0f, 1.35f)
-            setTextColor(0xFFE8F0F8.toInt())
-            setBackgroundColor(0xFF14181F.toInt())
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-        }
-        val scroll = ScrollView(this).apply {
-            addView(resultView, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(240)))
-        }
-
-        val feedbackLabel = TextView(this).apply {
-            text = "面试反馈"
-            textSize = 13f
-            setTextColor(0xFF8A8F9C.toInt())
-            setPadding(0, dp(6), 0, dp(6))
-        }
-
-        feedbackView = TextView(this).apply {
-            text = "答题结束后，将基于你的回答生成点评与改进建议。"
-            textSize = 14f
-            setTextIsSelectable(true)
-            setLineSpacing(0f, 1.35f)
-            setTextColor(0xFFE8F0F8.toInt())
-            setBackgroundColor(0xFF1A2230.toInt())
-            setPadding(dp(14), dp(14), dp(14), dp(14))
-        }
-        val feedbackScroll = ScrollView(this).apply {
-            addView(feedbackView, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(150)))
-        }
-
-        btnStart = TextView(this).apply {
-            text = "开始答题"
-            textSize = 18f
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = android.view.Gravity.CENTER
-            setBackgroundColor(0xFF2E7CF6.toInt())
-            setPadding(0, dp(18), 0, dp(18))
-            setOnClickListener { onStartStopClicked() }
-        }
-        val btnLp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(56)).apply {
-            topMargin = dp(20)
-        }
-
-        root.addView(title)
-        root.addView(subtitle)
-        root.addView(statusView)
-        root.addView(questionLabel)
-        root.addView(questionView)
-        root.addView(resultLabel)
-        root.addView(scroll)
-        root.addView(feedbackLabel)
-        root.addView(feedbackScroll)
-        root.addView(btnStart, btnLp)
-        setContentView(root)
+    // ---------- UI（深色科技 HUD · 深墨底 + 青色荧光 + 大圆角） ----------
+    private object C {
+        // 方案 B · 浅色莫兰迪：暖白底 + 灰绿 / 豆沙 + 大圆角
+        val BG = 0xFFF4F1EC.toInt()
+        val CARD = 0xFFFFFDF9.toInt()
+        val STROKE = 0x33D8D1C6
+        val ACCENT = 0xFF8FA69B.toInt()   // 灰绿
+        val ACCENT_SOFT = 0xFF5F7A6E.toInt()
+        val ROSE = 0xFFC8A5A0.toInt()     // 豆沙
+        val ROSE_DEEP = 0xFFB07F79.toInt()
+        val TEXT = 0xFF2F2E2C.toInt()
+        val BODY = 0xFF6E6A64.toInt()
+        val DIM = 0xFF9A948C.toInt()
+        val LABEL = 0xFFA9A29A.toInt()
+        val RED = 0xFFB07F79.toInt()
     }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun rounded(color: Int, stroke: Int? = null, radius: Int = 24): GradientDrawable =
+        GradientDrawable().apply {
+            cornerRadius = dp(radius).toFloat()
+            setColor(color)
+            if (stroke != null) setStroke(dp(1), stroke)
+        }
+
+    private fun card(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(18), dp(16), dp(18), dp(16))
+        background = rounded(C.CARD, C.STROKE, 22)
+        elevation = dp(6).toFloat()
+    }
+
+    private fun label(t: String): TextView = TextView(this).apply {
+        text = t
+        textSize = 10f
+        letterSpacing = 0.18f
+        setTextColor(C.LABEL)
+        setPadding(dp(2), 0, 0, dp(8))
+    }
+
+    private fun cardLp(): LinearLayout.LayoutParams =
+        LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(12) }
+
+    private fun buildUi() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(C.BG)
+            setPadding(dp(18), dp(44), dp(18), dp(16))
+        }
+
+        // 顶栏：品牌 + 模式胶囊 + 设置
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, dp(14))
+        }
+        val brand = TextView(this).apply {
+            text = "面试博弈助手"
+            textSize = 19f
+            setTextColor(C.TEXT)
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        modeChip = TextView(this).apply {
+            text = if (assistMode) "真人辅助" else "练习模式"
+            textSize = 12f
+            setTextColor(C.ACCENT_SOFT)
+            gravity = Gravity.CENTER
+            setPadding(dp(13), dp(7), dp(13), dp(7))
+            background = rounded(0xFFE4EAE5.toInt(), null, 999)
+            setOnClickListener { toggleMode() }
+        }
+        val gear = TextView(this).apply {
+            text = "设置"
+            textSize = 12f
+            setTextColor(C.DIM)
+            setPadding(dp(12), dp(8), dp(4), dp(8))
+            setOnClickListener { openSettings() }
+        }
+        header.addView(brand, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        header.addView(modeChip)
+        header.addView(gear)
+
+        val cards = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        // 1) 面试官提问
+        val qCard = card()
+        qCard.addView(label("面试官提问"))
+        questionView = TextView(this).apply {
+            text = if (assistMode) "等待面试官提问…" else "点击开始答题，面试官将提问"
+            textSize = 19f
+            setTextColor(C.TEXT)
+            typeface = Typeface.DEFAULT_BOLD
+            setLineSpacing(dp(4).toFloat(), 1.25f)
+        }
+        qCard.addView(questionView)
+        cards.addView(qCard, cardLp())
+
+        // 2) 实时转写（辅助模式为迷你灰字）
+        transcriptCard = card()
+        transcriptCard.addView(label("实时转写"))
+        resultView = TextView(this).apply {
+            text = resultPlaceholder
+            textSize = if (assistMode) 12f else 14f
+            setTextColor(if (assistMode) C.DIM else C.BODY)
+            setLineSpacing(dp(5).toFloat(), 1.4f)
+            setTextIsSelectable(true)
+        }
+        transcriptCard.addView(resultView)
+        cards.addView(transcriptCard, cardLp())
+
+        // 3) 开场话术（可直接说出口）
+        strategyView = TextView(this).apply {
+            text = "提问后 3 秒内给出可直接说出口的开场话术。"
+            textSize = 18f
+            setTextColor(C.TEXT)
+            setLineSpacing(dp(6).toFloat(), 1.45f)
+            setTextIsSelectable(true)
+        }
+        chipsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(10), 0, 0)
+        }
+        val strategyCard = card()
+        strategyCard.addView(label("开场话术 · 可直接说"))
+        strategyCard.addView(strategyView)
+        strategyCard.addView(chipsRow)
+        cards.addView(strategyCard, cardLp())
+
+        // 4) 预判追问
+        nextView = TextView(this).apply {
+            text = "—"
+            textSize = 13f
+            setTextColor(C.BODY)
+            setLineSpacing(dp(4).toFloat(), 1.4f)
+        }
+        nextCard = card()
+        nextCard.addView(label("预判追问"))
+        nextCard.addView(nextView)
+        nextCard.visibility = View.GONE
+        cards.addView(nextCard, cardLp())
+
+        // 4.5) 空闲引导卡（填满中部空白，说明三步流程）
+        val hintBody = TextView(this).apply {
+            text = "点「开始答题」→ 面试官语音提问 → 3 秒内给出可直接说出口的话术并自动播报。\n" +
+                "真人面试时切到「真人辅助」，改成耳机里听提示。"
+            textSize = 13f
+            setTextColor(C.BODY)
+            setLineSpacing(dp(4).toFloat(), 1.5f)
+        }
+        hintCard = card()
+        hintCard.addView(label("怎么用"))
+        hintCard.addView(hintBody)
+        cards.addView(hintCard, cardLp())
+
+        // 5) 复盘
+        feedbackView = TextView(this).apply {
+            text = ""
+            textSize = 13f
+            setTextColor(C.BODY)
+            setLineSpacing(dp(4).toFloat(), 1.45f)
+            setTextIsSelectable(true)
+        }
+        feedbackCard = card()
+        feedbackCard.addView(label("本轮复盘"))
+        feedbackCard.addView(feedbackView)
+        feedbackCard.visibility = View.GONE
+        cards.addView(feedbackCard, cardLp())
+
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            addView(cards, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+
+        // 状态条：波形 + 收音状态 + 播报进度
+        val statusStrip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(10), dp(4), dp(8))
+        }
+        waveView = WaveView(this)
+        statusView = TextView(this).apply {
+            text = "就绪"
+            textSize = 11f
+            letterSpacing = 0.08f
+            setTextColor(C.DIM)
+            typeface = Typeface.MONOSPACE
+            setPadding(dp(10), 0, 0, 0)
+        }
+        speakStateView = TextView(this).apply {
+            text = ""
+            textSize = 11f
+            setTextColor(C.ROSE_DEEP)
+        }
+        statusStrip.addView(waveView, LinearLayout.LayoutParams(dp(58), dp(26)))
+        statusStrip.addView(statusView, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        statusStrip.addView(speakStateView)
+
+        // 底部按钮
+        btnStart = TextView(this).apply {
+            text = "开始答题"
+            textSize = 17f
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+            background = rounded(C.ROSE, null, 22)
+            setTextColor(0xFFFFFFFF.toInt())
+            setPadding(0, dp(17), 0, dp(17))
+            setOnClickListener { onStartStopClicked() }
+        }
+        val btnSpeak = TextView(this).apply {
+            text = "重新播报"
+            textSize = 15f
+            setTextColor(C.ACCENT_SOFT)
+            gravity = Gravity.CENTER
+            background = rounded(C.CARD, C.STROKE, 22)
+            setPadding(dp(14), dp(17), dp(14), dp(17))
+            setOnClickListener { speakCurrentStrategy() }
+        }
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(6), 0, 0)
+        }
+        val speakLp = LinearLayout.LayoutParams(dp(118), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            rightMargin = dp(10)
+        }
+        btnRow.addView(btnSpeak, speakLp)
+        btnRow.addView(btnStart, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        root.addView(header)
+        root.addView(scroll, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(statusStrip)
+        root.addView(btnRow)
+        setContentView(root)
+    }
+
+    private fun refreshModeUi() {
+        modeChip.text = if (assistMode) "真人辅助" else "练习模式"
+        resultView.textSize = if (assistMode) 12f else 14f
+        resultView.setTextColor(if (assistMode) C.DIM else C.BODY)
+        questionView.text = if (assistMode) "等待面试官提问…" else "点击开始答题，面试官将提问"
+        resultView.text = resultPlaceholder
+        strategyView.text = if (assistMode)
+            "听到提问后自动生成可直接说出口的话术并播报。"
+        else "提问后 3 秒内给出可直接说出口的开场话术。"
+        nextCard.visibility = View.GONE
+        feedbackCard.visibility = View.GONE
+        speakStateView.text = ""
+        status("就绪")
+    }
+
+    private fun toggleMode() {
+        assistMode = !assistMode
+        Prefs.setMode(this, if (assistMode) Prefs.MODE_ASSIST else Prefs.MODE_PRACTICE)
+        refreshModeUi()
+        log("切换模式: ${if (assistMode) "真人辅助" else "练习模式"}")
+    }
+
+    // ---------- 设置弹窗（阈值滑杆 / 播报开关） ----------
+    private fun openSettings() {
+        val pad = dp(20)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, dp(18), pad, dp(14))
+            background = rounded(C.CARD, C.STROKE, 24)
+        }
+        box.addView(TextView(this).apply {
+            text = "设置"
+            textSize = 18f
+            setTextColor(C.TEXT)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, dp(14))
+        })
+
+        box.addView(label("面试官提问过滤阈值"))
+        val valueView = TextView(this).apply {
+            text = String.format(Locale.US, "相似度 ≥ %.2f", Prefs.threshold(this@MainActivity))
+            textSize = 15f
+            setTextColor(C.ACCENT_SOFT)
+            typeface = Typeface.MONOSPACE
+        }
+        val seek = SeekBar(this).apply {
+            max = 60
+            progress = ((Prefs.threshold(this@MainActivity) - Prefs.MIN_THRESHOLD) /
+                (Prefs.MAX_THRESHOLD - Prefs.MIN_THRESHOLD) * 60).toInt()
+            progressTintList = ColorStateList.valueOf(C.ACCENT)
+            thumbTintList = ColorStateList.valueOf(C.ACCENT)
+        }
+        val hint = TextView(this).apply {
+            text = "越高越严格：只过滤与题目高度重合的句子；越低越激进，可能误伤候选人复述题目。"
+            textSize = 11f
+            setTextColor(C.DIM)
+            setLineSpacing(dp(3).toFloat(), 1.35f)
+            setPadding(0, dp(4), 0, dp(12))
+        }
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                val v = Prefs.MIN_THRESHOLD + (Prefs.MAX_THRESHOLD - Prefs.MIN_THRESHOLD) * p / 60f
+                valueView.text = String.format(Locale.US, "相似度 ≥ %.2f", v)
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        box.addView(valueView)
+        box.addView(seek)
+        box.addView(hint)
+
+        val speakSwitch = android.widget.Switch(this).apply {
+            text = "话术自动播报"
+            textSize = 14f
+            setTextColor(C.TEXT)
+            isChecked = Prefs.speakEnabled(this@MainActivity)
+            setPadding(0, dp(6), 0, dp(12))
+        }
+        box.addView(speakSwitch)
+
+        val done = TextView(this).apply {
+            text = "保存"
+            textSize = 15f
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.CENTER
+            background = rounded(C.ACCENT, null, 18)
+            setPadding(0, dp(13), 0, dp(13))
+            setOnClickListener { }
+        }
+        box.addView(done)
+
+        val dlg = AlertDialog.Builder(this).setView(box).create()
+        done.setOnClickListener {
+            val v = Prefs.MIN_THRESHOLD + (Prefs.MAX_THRESHOLD - Prefs.MIN_THRESHOLD) * seek.progress / 60f
+            Prefs.setThreshold(this, v)
+            Prefs.setSpeakEnabled(this, speakSwitch.isChecked)
+            log(String.format(Locale.US, "设置已保存: 阈值=%.2f 播报=%s", Prefs.threshold(this), Prefs.speakEnabled(this)))
+            dlg.dismiss()
+        }
+        dlg.setOnShowListener {
+            dlg.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
+            dlg.window?.setLayout(dp(340), android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        dlg.show()
+    }
+
+    /** 简易音量波形：随录音 RMS 更新 */
+    private class WaveView(ctx: Context) : View(ctx) {
+        private val bars = FloatArray(14) { 0.18f }
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF8FA69B.toInt() }
+        fun push(rms: Double) {
+            val v = (rms / 5000.0).toFloat().coerceIn(0.12f, 1f)
+            for (i in bars.size - 1 downTo 1) bars[i] = bars[i - 1]
+            bars[0] = v
+            invalidate()
+        }
+        override fun onDraw(canvas: Canvas) {
+            val w = width.toFloat() / bars.size
+            val h = height.toFloat()
+            for (i in bars.indices) {
+                val bh = (bars[i] * h).coerceAtLeast(3f)
+                val left = i * w + 1f
+                val top = (h - bh) / 2f
+                paint.color = if (bars[i] > 0.55f) 0xFF8FA69B.toInt() else 0xFFC3CFC8.toInt()
+                canvas.drawRoundRect(RectF(left, top, left + w * 0.55f, top + bh), 2f, 2f, paint)
+            }
+        }
+    }
 
     private fun onStartStopClicked() {
         if (transcribing) stopTranscribe("用户点击停止")
@@ -298,7 +592,9 @@ class MainActivity : Activity() {
     private fun setButtonRunning(running: Boolean) {
         handler.post {
             btnStart.text = if (running) "停止答题" else "开始答题"
-            btnStart.setBackgroundColor(if (running) 0xFFE5484D.toInt() else 0xFF2E7CF6.toInt())
+            hintCard.visibility = if (running) View.GONE else hintCard.visibility
+            btnStart.background = rounded(if (running) C.ROSE_DEEP else C.ROSE, null, 22)
+            btnStart.setTextColor(0xFFFFFFFF.toInt())
         }
     }
 
@@ -319,10 +615,20 @@ class MainActivity : Activity() {
         if (t.isEmpty()) return
         if (isInterviewerQuestion(t, bg, ed)) {
             droppedSentences++
-            log("过滤面试官提问句(bg=${bg}ms ed=${ed}ms): $t")
+            log(String.format(Locale.US, "过滤面试官提问句(阈值%.2f, bg=${bg}ms ed=${ed}ms): $t", Prefs.threshold(this)))
             return
         }
         committedText.append(t)
+        if (assistMode) {
+            if (looksLikeQuestion(t)) {
+                log("识别到提问: $t → 800ms 后生成话术")
+                handler.post { questionView.text = t }
+                scheduleStrategy(t, 800)
+            } else {
+                // 候选人回答期间若有停顿，也允许基于上下文补一版话术（同一问题 30s 内去重）
+                handler.removeCallbacks(strategyDebounce)
+            }
+        }
     }
 
     /**
@@ -336,7 +642,8 @@ class MainActivity : Activity() {
         val inTtsWindow = ed >= ttsStartMs - 800 && bg <= ttsEndMs + 800
         if (!inTtsWindow) return false
         val sim = charOverlap(q, text)
-        return sim >= 0.55
+        val th = Prefs.threshold(this)
+        return sim >= th
     }
 
     /** 字符多重集重合率：|交集| / |问题文本|，忽略标点与空白 */
@@ -356,6 +663,7 @@ class MainActivity : Activity() {
 
     private fun appendFeedback(text: String) {
         handler.post {
+            feedbackCard.visibility = View.VISIBLE
             val placeholder = "答题结束后，将基于你的回答生成点评与改进建议。"
             feedbackView.text = if (feedbackView.text.isEmpty() || feedbackView.text == placeholder)
                 text else feedbackView.text.toString() + text
@@ -432,6 +740,7 @@ class MainActivity : Activity() {
                 if (status == TextToSpeech.SUCCESS) {
                     ttsReady = true
                     val lang = tts?.setLanguage(Locale.CHINA)
+                    tts?.setSpeechRate(1.1f) // 播报 24 字控制在 5 秒内
                     log("TTS 初始化成功；setLanguage(zh_CN)=$lang")
                 } else {
                     log("TTS 初始化失败 status=$status（检查系统 TTS 引擎与语音包）")
@@ -452,16 +761,25 @@ class MainActivity : Activity() {
         }
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
+                if (utteranceId?.startsWith("strategy_") == true) return
                 ttsStartMs = SystemClock.elapsedRealtime() - recordStartElapsed
                 log("TTS 播题开始 @${ttsStartMs}ms（计入面试官提问过滤时间窗）")
             }
             override fun onDone(utteranceId: String?) {
+                if (utteranceId?.startsWith("strategy_") == true) {
+                    val cost = SystemClock.elapsedRealtime() - speakStartAt
+                    log("话术播报完成，用时 ${cost}ms")
+                    handler.post { speakStateView.text = "" }
+                    return
+                }
                 ttsEndMs = SystemClock.elapsedRealtime() - recordStartElapsed
                 log("TTS 播题完成 @${ttsEndMs}ms")
+                // 题目播完 → 生成博弈话术（真人辅助模式由转写里的提问触发）
+                scheduleStrategy(lastQuestion, 200)
             }
-            override fun onError(utteranceId: String?) { log("TTS 播题错误") }
+            override fun onError(utteranceId: String?) { log("TTS 错误: $utteranceId") }
             @Deprecated("Deprecated in Java")
-            override fun onError(utteranceId: String?, errorCode: Int) { log("TTS 播题错误 code=$errorCode") }
+            override fun onError(utteranceId: String?, errorCode: Int) { log("TTS 错误 code=$errorCode") }
         })
         val res = tts?.speak(q, TextToSpeech.QUEUE_FLUSH, null, "question_$idx")
         log("TTS speak 题目返回=$res")
@@ -538,6 +856,8 @@ class MainActivity : Activity() {
                     }
                     stream?.write(buf, 0, n)
                     onFrame?.invoke(buf, n)
+                    val rmsNow = lastRms
+                    handler.post { waveView.push(rmsNow) }
                 } else if (n < 0) {
                     log("录音 read 返回错误码 $n")
                 }
@@ -619,9 +939,9 @@ class MainActivity : Activity() {
         setButtonRunning(true)
         // 前台服务保活：ColorOS 后台冻结会导致推流线程卡死
         try { startService(Intent(this, DiagService::class.java)) } catch (e: Exception) { log("前台服务启动失败: ${e.message}") }
-        // 面试官语音提问（TTS 播题），与录音同时进行（诊断版 Test C 已验证同时录播不冲突）
+        // 练习模式：TTS 播题 + 录音同时进行；真人辅助模式：只收音，不播题
         initTtsIfNeeded()
-        handler.postDelayed({ speakQuestion() }, 600)
+        if (!assistMode) handler.postDelayed({ speakQuestion() }, 600)
 
         val url = buildXfUrl()
         log("连接讯飞 RTASR-LLM…（role_type=2 角色分离）")
@@ -868,6 +1188,128 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             log("解析消息失败: ${e.message}")
         }
+    }
+
+    // ---------- 博弈话术：生成 + 播报 ----------
+    private var strategyJob = 0
+    private var lastStrategyQuestion = ""
+    private var lastStrategyAt = 0L
+    private var currentStrategy = ""
+    private var pendingQuestion = ""
+    private var speakStartAt = 0L
+    private val strategyDebounce = Runnable { generateStrategy(pendingQuestion) }
+
+    private val speakTicker = object : Runnable {
+        override fun run() {
+            val sec = (SystemClock.elapsedRealtime() - speakStartAt) / 1000
+            speakStateView.text = String.format(Locale.US, "VOICE %02d / 05s", sec.coerceAtMost(5))
+            if (sec >= 5) {
+                handler.postDelayed({ speakStateView.text = "" }, 1000)
+                return
+            }
+            handler.postDelayed(this, 200)
+        }
+    }
+
+    private fun onDebugQuestion(q: String) {
+        log("DEBUG 注入提问: $q")
+        questionView.text = q
+        scheduleStrategy(q, 200)
+    }
+
+    private fun looksLikeQuestion(s: String): Boolean {
+        val q = s.trim()
+        if (q.length < 4) return false
+        if (q.endsWith("？") || q.endsWith("?")) return true
+        return arrayOf("吗", "多少", "怎么", "为什么", "如何", "是否", "能不能", "有没有", "哪", "几")
+            .any { q.contains(it) }
+    }
+
+    private fun scheduleStrategy(question: String, delayMs: Long = 800) {
+        if (question.isBlank()) return
+        pendingQuestion = question
+        handler.removeCallbacks(strategyDebounce)
+        handler.postDelayed(strategyDebounce, delayMs)
+    }
+
+    private fun generateStrategy(question: String) {
+        val q = question.trim()
+        if (q.isEmpty()) return
+        val now = SystemClock.elapsedRealtime()
+        if (q == lastStrategyQuestion && now - lastStrategyAt < 30_000) {
+            log("同一问题 30s 内已生成话术，跳过: $q")
+            return
+        }
+        lastStrategyQuestion = q
+        lastStrategyAt = now
+        val job = ++strategyJob
+        status("生成话术…")
+        log("开始生成话术: $q")
+        val t0 = SystemClock.elapsedRealtime()
+        Thread {
+            val tips = matchCorpus(q, "")
+            val advice = StrategyEngine.generate(q, tips, DEEPSEEK_API_KEY)
+            handler.post {
+                if (job != strategyJob) return@post
+                if (advice.error.isNotEmpty()) {
+                    log("话术生成失败: ${advice.error}")
+                    strategyView.text = "话术生成失败：${advice.error.take(60)}"
+                    status("话术生成失败")
+                    return@post
+                }
+                val total = SystemClock.elapsedRealtime() - t0
+                log("话术就绪: 模型${advice.elapsedMs}ms / 总${total}ms | SAY=${advice.opening} | NEXT=${advice.followup}")
+                currentStrategy = advice.opening
+                strategyView.text = "「${advice.opening}」"
+                renderChips(advice.opening)
+                if (advice.followup.isNotBlank()) {
+                    nextView.text = advice.followup
+                    nextCard.visibility = View.VISIBLE
+                }
+                status(if (assistMode) "收音中" else "答题中")
+                if (Prefs.speakEnabled(this@MainActivity)) speakStrategy(advice.opening)
+            }
+        }.apply { isDaemon = true; name = "strategy-gen" }.start()
+    }
+
+    private fun renderChips(content: String) {
+        chipsRow.removeAllViews()
+        val re = Regex("""(\d+(?:\.\d+)?\s*(?:万|亿|%|个|天|家|倍))""")
+        val found = re.findAll(content).map { it.value }.distinct().take(3).toList()
+        for (f in found) {
+            chipsRow.addView(TextView(this).apply {
+                text = f
+                textSize = 11f
+                setTextColor(C.BODY)
+                setPadding(dp(11), dp(6), dp(11), dp(6))
+                background = rounded(0xFFF0EDE6.toInt(), null, 999)
+            }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(8) })
+        }
+        chipsRow.visibility = if (found.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    private fun speakCurrentStrategy() {
+        val s = currentStrategy.ifBlank { strategyView.text.toString().trim('「', '」', ' ') }
+        if (s.isBlank() || s.startsWith("话术生成失败")) {
+            status("暂无可播报话术")
+            return
+        }
+        speakStrategy(s)
+    }
+
+    private fun speakStrategy(text: String) {
+        if (!ttsReady) {
+            log("TTS 未就绪，话术仅上屏")
+            return
+        }
+        val say = StrategyEngine.speechText(text)
+        speakStartAt = SystemClock.elapsedRealtime()
+        tts?.speak(say, TextToSpeech.QUEUE_FLUSH, null, "strategy_$speakStartAt")
+        log("播报话术(${say.length}字): $say")
+        handler.removeCallbacks(speakTicker)
+        handler.post(speakTicker)
     }
 
     // ---------- 生命周期 ----------
