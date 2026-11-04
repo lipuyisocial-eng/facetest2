@@ -95,31 +95,6 @@ class MainActivity : Activity() {
             "你是资深面试官。根据候选人对面试问题的回答，用中文给出简短点评：先说1句优点，" +
             "再说1-2句可改进的具体建议。直接输出内容，不要客套，不要使用markdown符号，不超过120字。"
 
-        // 知识库语料（assets/corpus/*.txt，由 CC014 面试语料按主题切分生成，合计约 136KB）
-        private val CORPUS_TOPICS = arrayOf(
-            "zwojieshao", "lizhiyuanyin", "youquedian", "xinzidaiyu", "zhiyeguihua",
-            "jiaban", "yingsheng", "tiaocao", "yali", "tuandui", "xiangmu",
-            "fanwen", "kongchuan", "qiweifan", "tongxue"
-        )
-        // 主题 → 命中关键词（题目/回答中出现即注入对应语料要点）
-        private val CORPUS_KEYWORDS = mapOf(
-            "zwojieshao" to arrayOf("自我介绍", "介绍一下自己", "做个自我介绍"),
-            "lizhiyuanyin" to arrayOf("离职原因", "为什么离职", "离开上家", "上家公司"),
-            "youquedian" to arrayOf("优点", "缺点", "优势", "劣势", "不足", "长处"),
-            "xinzidaiyu" to arrayOf("薪资", "工资", "薪酬", "待遇", "期望薪资", "薪水"),
-            "zhiyeguihua" to arrayOf("职业规划", "职业发展", "未来规划", "长期规划", "发展目标"),
-            "jiaban" to arrayOf("加班", "996", "工作强度"),
-            "yingsheng" to arrayOf("应届", "校招", "毕业生", "刚毕业", "实习"),
-            "tiaocao" to arrayOf("跳槽", "频繁换工作", "换了几份"),
-            "yali" to arrayOf("压力", "抗压", "焦虑"),
-            "tuandui" to arrayOf("团队", "协作", "合作", "同事", "沟通", "冲突"),
-            "xiangmu" to arrayOf("项目经验", "做过什么项目", "项目经历", "负责过", "做过哪些"),
-            "fanwen" to arrayOf("你有什么问题", "反问", "还有什么想问"),
-            "kongchuan" to arrayOf("空窗期", "断档", "没有工作", "待业"),
-            "qiweifan" to arrayOf("为什么选择我们", "为什么来我们", "了解我们公司", "期望"),
-            "tongxue" to arrayOf("住在哪里", "通勤", "爱好", "兴趣", "性格", "老家")
-        )
-
         private val QUESTIONS = arrayOf(
             "请先做个简短的自我介绍。",
             "你的主要优点和缺点是什么？",
@@ -148,6 +123,8 @@ class MainActivity : Activity() {
     private lateinit var transcriptCard: LinearLayout
     private lateinit var nextCard: LinearLayout
     private lateinit var hintCard: LinearLayout
+    private lateinit var uploadCard: LinearLayout
+    private lateinit var uploadInfo: TextView
     private lateinit var feedbackCard: LinearLayout
     private lateinit var waveView: WaveView
     private var assistMode = false
@@ -203,9 +180,9 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v1.9.0（五维20分制 · 理解中进度 · 雷达图）")
+        log("应用启动 v2.0.0（内置知识库 · 首页上传 · 五维复盘）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
-        loadCorpus()
+        BuiltinKnowledge.ensureLoaded(this)
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
         checkRecordPermission()
         // 调试钩子：adb am start -e debug_question "问题" 可直接驱动「真人辅助」提问识别链路（仅 debug 包）
@@ -342,13 +319,6 @@ class MainActivity : Activity() {
             setPadding(dp(8), dp(8), dp(8), dp(8))
             setOnClickListener { openReportList() }
         }
-        val docsBtn = TextView(this).apply {
-            text = "资料"
-            textSize = 12f
-            setTextColor(C.DIM)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            setOnClickListener { openDocs() }
-        }
         val gear = TextView(this).apply {
             text = "设置"
             textSize = 12f
@@ -359,7 +329,6 @@ class MainActivity : Activity() {
         header.addView(brand, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         header.addView(modeChip)
         header.addView(reportBtn)
-        header.addView(docsBtn)
         header.addView(gear)
 
         val cards = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -433,6 +402,40 @@ class MainActivity : Activity() {
         hintCard.addView(label("怎么用"))
         hintCard.addView(hintBody)
         cards.addView(hintCard, cardLp())
+
+        // 首页上传卡片（面试开始前上传项目资料；运行时隐藏）
+        uploadInfo = TextView(this).apply {
+            text = "上传项目 PDF / Word / 截图，话术会优先引用里面的真实数据；内置面试知识库会自动作为参考。"
+            textSize = 13f
+            setTextColor(C.BODY)
+            setLineSpacing(dp(4).toFloat(), 1.45f)
+        }
+        val uploadBtn = TextView(this).apply {
+            text = "上传项目资料"
+            textSize = 14f
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+            background = rounded(C.ACCENT, null, 18)
+            setPadding(0, dp(12), 0, dp(12))
+            setOnClickListener { pickDocument() }
+        }
+        val manageBtn = TextView(this).apply {
+            text = "管理已上传 ›"
+            textSize = 12f
+            setTextColor(C.ACCENT_SOFT)
+            setPadding(dp(4), dp(10), 0, dp(2))
+            setOnClickListener { openDocs() }
+        }
+        uploadCard = card()
+        uploadCard.addView(label("资料 / 项目经历"))
+        uploadCard.addView(uploadInfo)
+        uploadCard.addView(uploadBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(10)
+        })
+        uploadCard.addView(manageBtn)
+        cards.addView(uploadCard, cardLp())
 
         // 5) 复盘
         feedbackView = TextView(this).apply {
@@ -532,6 +535,7 @@ class MainActivity : Activity() {
         feedbackCard.visibility = View.GONE
         speakStateView.text = ""
         status("就绪")
+        refreshUploadCard()
     }
 
     private fun toggleMode() {
@@ -539,6 +543,16 @@ class MainActivity : Activity() {
         Prefs.setMode(this, if (assistMode) Prefs.MODE_ASSIST else Prefs.MODE_PRACTICE)
         refreshModeUi()
         log("切换模式: ${if (assistMode) "真人辅助" else "练习模式"}")
+    }
+
+    private fun refreshUploadCard() {
+        if (!::uploadInfo.isInitialized) return
+        val n = DocumentStore.list(this).size
+        val chars = DocumentStore.totalChars(this)
+        uploadInfo.text = if (n == 0)
+            "上传项目 PDF / Word / 截图，话术会优先引用里面的真实数据；内置面试知识库会自动作为参考。"
+        else
+            "已上传 $n 份资料（$chars 字）。话术会优先引用你的真实项目数据，内置知识库只作方法论参考。"
     }
 
     // ---------- F2 资料库（导入 / 查看 / 删除 / 检索） ----------
@@ -600,6 +614,7 @@ class MainActivity : Activity() {
                     setOnClickListener {
                         DocumentStore.delete(this@MainActivity, d.id)
                         log("资料删除: ${d.name}")
+                        refreshUploadCard()
                     }
                 })
                 listBox.addView(row)
@@ -631,12 +646,8 @@ class MainActivity : Activity() {
         }
         box.addView(close)
 
-        val dlg = AlertDialog.Builder(this).setView(box).create()
+        val dlg = buildRoundedDialog(box, 350, 620)
         close.setOnClickListener { dlg.dismiss() }
-        dlg.setOnShowListener {
-            dlg.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
-            dlg.window?.setLayout(dp(350), android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
-        }
         dlg.show()
     }
 
@@ -690,6 +701,7 @@ class MainActivity : Activity() {
                     }
                     log("资料导入成功: ${doc.name} | 方式=${parsed.method} 页数=${parsed.pages} 字数=${doc.chars}")
                     status("资料已入库：${doc.name}（${doc.chars}字）")
+                    refreshUploadCard()
                     openDocs()
                 }
             } catch (e: Exception) {
@@ -730,6 +742,33 @@ class MainActivity : Activity() {
         }
         dlg.show()
         return dlg to tv
+    }
+
+    /**
+     * 统一风格弹窗：24dp 大圆角卡片 + 内部滚动。
+     * 先按内容测量高度，超过屏幕 82%（或 maxHeightDp）才封顶给 ScrollView，保证四个角始终可见。
+     */
+    private fun buildRoundedDialog(content: android.view.View, widthDp: Int = 350, maxHeightDp: Int = 620): AlertDialog {
+        val scroll = ScrollView(this).apply { addView(content) }
+        val container = android.widget.FrameLayout(this).apply {
+            background = rounded(C.CARD, C.STROKE, 24)
+            addView(scroll)
+        }
+        val dlg = AlertDialog.Builder(this).setView(container).create()
+        dlg.setOnShowListener {
+            dlg.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
+            val w = dp(widthDp)
+            container.post {
+                val dm = resources.displayMetrics
+                val cap = minOf((dm.heightPixels * 0.82f).toInt(), dp(maxHeightDp))
+                val contentH = content.height
+                val h = if (contentH in 1..cap) contentH else cap
+                scroll.layoutParams = android.widget.FrameLayout.LayoutParams(
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT, h)
+                dlg.window?.setLayout(w, h)
+            }
+        }
+        return dlg
     }
 
     private fun queryDisplayName(uri: Uri): String {
@@ -845,7 +884,7 @@ class MainActivity : Activity() {
         }
         box.addView(done)
 
-        val dlg = AlertDialog.Builder(this).setView(box).create()
+        val dlg = buildRoundedDialog(box, 350, 660)
         dlgRef = dlg
         done.setOnClickListener {
             val v = Prefs.MIN_THRESHOLD + (Prefs.MAX_THRESHOLD - Prefs.MIN_THRESHOLD) * seek.progress / 60f
@@ -853,10 +892,6 @@ class MainActivity : Activity() {
             Prefs.setSpeakEnabled(this, speakSwitch.isChecked)
             log(String.format(Locale.US, "设置已保存: 阈值=%.2f 播报=%s", Prefs.threshold(this), Prefs.speakEnabled(this)))
             dlg.dismiss()
-        }
-        dlg.setOnShowListener {
-            dlg.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
-            dlg.window?.setLayout(dp(340), android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
         }
         dlg.show()
     }
@@ -989,6 +1024,7 @@ class MainActivity : Activity() {
         handler.post {
             btnStart.text = if (running) "停止答题" else "开始答题"
             hintCard.visibility = if (running) View.GONE else hintCard.visibility
+            uploadCard.visibility = if (running) View.GONE else View.VISIBLE
             btnStart.background = rounded(if (running) C.ROSE_DEEP else C.ROSE, null, 22)
             btnStart.setTextColor(0xFFFFFFFF.toInt())
         }
@@ -1068,39 +1104,6 @@ class MainActivity : Activity() {
     }
 
     private fun log(msg: String) = Log.i(TAG, msg)
-
-    // ---------- 知识库语料（CC014 面试语料，assets/corpus/*.txt） ----------
-    private val corpusCache = HashMap<String, String>()
-
-    private fun loadCorpus() {
-        try {
-            for (topic in CORPUS_TOPICS) {
-                val path = "corpus/$topic.txt"
-                val text = assets.open(path).bufferedReader(Charsets.UTF_8).use { it.readText() }
-                if (text.isNotBlank()) corpusCache[topic] = text
-            }
-            log("知识库语料加载完成: ${corpusCache.size}/${CORPUS_TOPICS.size} 个主题")
-        } catch (e: Exception) {
-            log("知识库语料加载失败: ${e.message}")
-        }
-    }
-
-    /** 题目/回答关键词命中知识库主题 → 返回注入用的要点片段（最多 2 主题，每段 ≤900 字） */
-    private fun matchCorpus(question: String, answer: String): String {
-        val haystack = "$question $answer"
-        val hits = LinkedHashSet<String>()
-        for ((topic, kws) in CORPUS_KEYWORDS) {
-            if (hits.size >= 2) break
-            if (kws.any { haystack.contains(it) }) hits.add(topic)
-        }
-        if (hits.isEmpty()) return ""
-        val sb = StringBuilder("\n\n【参考要点（来自面试知识库，仅作点评依据，不要照抄）】\n")
-        for (t in hits) {
-            val c = corpusCache[t]
-            if (!c.isNullOrBlank()) sb.append("[$t] ").append(c.take(900)).append("\n")
-        }
-        return sb.toString()
-    }
 
     private fun status(msg: String) { handler.post { statusView.text = msg } }
 
@@ -1432,7 +1435,7 @@ class MainActivity : Activity() {
         }
         log("生成反馈: 题目=$lastQuestion | 回答($source)=${answer.take(40)}…")
         // 知识库命中注入：题目+回答关键词 → 语料要点拼进 system prompt
-        val tips = matchCorpus(lastQuestion, answer)
+        val tips = BuiltinKnowledge.retrieve(this, lastQuestion)
         if (tips.isNotEmpty()) log("知识库命中，注入参考要点 ${tips.length} 字")
         Thread {
             try {
@@ -1635,7 +1638,7 @@ class MainActivity : Activity() {
             setTextColor(C.DIM)
             setPadding(0, dp(4), 0, dp(10))
         })
-        val dlg = AlertDialog.Builder(this).setView(box).create()
+        val dlg = buildRoundedDialog(box, 350, 560)
         if (items.isEmpty()) {
             box.addView(TextView(this).apply {
                 text = "答完一轮后会自动生成六维复盘，包括内容完整度、数据可信度、逻辑自洽、表达结构、追问防御、时间控制。"
@@ -1665,10 +1668,6 @@ class MainActivity : Activity() {
             setPadding(0, dp(14), 0, dp(6))
             setOnClickListener { dlg.dismiss() }
         })
-        dlg.setOnShowListener {
-            dlg.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
-            dlg.window?.setLayout(dp(350), android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
-        }
         dlg.show()
     }
 
@@ -1781,11 +1780,7 @@ class MainActivity : Activity() {
             setTextColor(C.LABEL)
             setPadding(0, dp(8), 0, 0)
         })
-        val dlg = AlertDialog.Builder(this).setView(android.widget.ScrollView(this).apply { addView(box) }).create()
-        dlg.setOnShowListener {
-            dlg.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
-            dlg.window?.setLayout(dp(360), dp(560))
-        }
+        val dlg = buildRoundedDialog(box, 360, 620)
         dlg.show()
     }
 
@@ -1847,10 +1842,11 @@ class MainActivity : Activity() {
         val t0 = SystemClock.elapsedRealtime()
         Thread {
             val rag = DocumentStore.retrieve(this, q)
-            val corpusTips = matchCorpus(q, "")
+            val builtin = BuiltinKnowledge.retrieve(this, q)
             val history = Conversation.contextPrompt()
-            val tips = rag + corpusTips
-            if (rag.isNotEmpty()) log("资料库检索命中 ${rag.length} 字（问题: $q）")
+            val tips = rag + builtin
+            if (rag.isNotEmpty()) log("上传资料命中 ${rag.length} 字（问题: $q）")
+            if (builtin.isNotEmpty()) log("内置知识库命中 ${builtin.length} 字（问题: $q）")
             if (history.isNotEmpty()) log("多轮上下文: 已有 ${Conversation.size()} 轮，注入 ${history.length} 字")
             val advice = StrategyEngine.generate(q, tips, DEEPSEEK_API_KEY, history)
             handler.post {
