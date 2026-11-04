@@ -1,7 +1,16 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+// 本地密钥（local.properties 已 gitignore，不随仓库推送；缺失时用占位编译）
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+val deepseekKey = localProps.getProperty("deepseek_key") ?: "sk-LOCAL_KEY_PLACEHOLDER"
 
 android {
     namespace = "com.xingyihui.interviewassistant.diag"
@@ -11,14 +20,19 @@ android {
         applicationId = "com.xingyihui.interviewassistant.diag"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "1.2.0"
+
+        buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepseekKey\"")
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
         }
+    }
+    buildFeatures {
+        buildConfig = true
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

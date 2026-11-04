@@ -20,15 +20,19 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import org.json.JSONObject
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString.Companion.encodeUtf8
 import okio.ByteString.Companion.toByteString
+import java.io.BufferedReader
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStreamReader
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import java.security.MessageDigest
@@ -65,6 +69,15 @@ class MainActivity : Activity() {
         private const val XF_APP_ID = "6eb32081"
         private const val XF_API_KEY = "9f15c5590c9bcb7ed781a8a6a4f61281"
 
+        // DeepSeek 回答反馈密钥 —— 用户提供（2026-11-04）；经 local.properties 注入 BuildConfig（不入库，防密钥泄露）；
+        // 正式对外发布必须改服务端代理，禁止前端直连暴露
+        private const val DEEPSEEK_API_KEY = BuildConfig.DEEPSEEK_API_KEY
+        private const val DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+        private const val DEEPSEEK_MODEL = "deepseek-chat"
+        private const val FEEDBACK_SYSTEM_PROMPT =
+            "你是资深面试官。根据候选人对面试问题的回答，用中文给出简短点评：先说1句优点，" +
+            "再说1-2句可改进的具体建议。直接输出内容，不要客套，不要使用markdown符号，不超过120字。"
+
         private val QUESTIONS = arrayOf(
             "请先做个简短的自我介绍。",
             "你的主要优点和缺点是什么？",
@@ -83,12 +96,17 @@ class MainActivity : Activity() {
     private lateinit var statusView: TextView
     private lateinit var questionView: TextView
     private lateinit var resultView: TextView
+    private lateinit var feedbackView: TextView
     private lateinit var btnStart: TextView
 
     // TTS 播题
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var questionIdx = 0
+    private var lastQuestion = ""
+
+    // 转写结果收集（供 DeepSeek 反馈）
+    private val resultBuffer = StringBuilder()
 
     // 录音
     private var audioRecord: AudioRecord? = null
@@ -180,7 +198,28 @@ class MainActivity : Activity() {
         }
         val scroll = ScrollView(this).apply {
             addView(resultView, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(320)))
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(240)))
+        }
+
+        val feedbackLabel = TextView(this).apply {
+            text = "面试反馈"
+            textSize = 13f
+            setTextColor(0xFF8A8F9C.toInt())
+            setPadding(0, dp(6), 0, dp(6))
+        }
+
+        feedbackView = TextView(this).apply {
+            text = "答题结束后，将基于你的回答生成点评与改进建议。"
+            textSize = 14f
+            setTextIsSelectable(true)
+            setLineSpacing(0f, 1.35f)
+            setTextColor(0xFFE8F0F8.toInt())
+            setBackgroundColor(0xFF1A2230.toInt())
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+        }
+        val feedbackScroll = ScrollView(this).apply {
+            addView(feedbackView, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(150)))
         }
 
         btnStart = TextView(this).apply {
@@ -203,6 +242,8 @@ class MainActivity : Activity() {
         root.addView(questionView)
         root.addView(resultLabel)
         root.addView(scroll)
+        root.addView(feedbackLabel)
+        root.addView(feedbackScroll)
         root.addView(btnStart, btnLp)
         setContentView(root)
     }
@@ -222,11 +263,21 @@ class MainActivity : Activity() {
     }
 
     private fun appendResult(text: String) {
+        if (text != "\n") resultBuffer.append(text)
         handler.post {
             val placeholder = "面试官语音提问后，你的回答将实时转为文字。"
             resultView.text = if (resultView.text.isEmpty() || resultView.text == placeholder)
                 text else resultView.text.toString() + text
             (resultView.parent as? ScrollView)?.fullScroll(View.FOCUS_DOWN)
+        }
+    }
+
+    private fun appendFeedback(text: String) {
+        handler.post {
+            val placeholder = "答题结束后，将基于你的回答生成点评与改进建议。"
+            feedbackView.text = if (feedbackView.text.isEmpty() || feedbackView.text == placeholder)
+                text else feedbackView.text.toString() + text
+            (feedbackView.parent as? ScrollView)?.fullScroll(View.FOCUS_DOWN)
         }
     }
 
@@ -278,6 +329,7 @@ class MainActivity : Activity() {
     private fun speakQuestion() {
         val idx = questionIdx
         val q = QUESTIONS[idx % QUESTIONS.size]
+        lastQuestion = q
         handler.post { questionView.text = "第${idx % QUESTIONS.size + 1}题：$q" }
         if (!ttsReady) {
             log("TTS 未就绪，题目仅显示不播报")
@@ -408,6 +460,7 @@ class MainActivity : Activity() {
         transcribing = true
         sendFrames = 0
         sendBytes = 0L
+        resultBuffer.setLength(0)
         frameQueue.clear()
         status("准备中…")
         setButtonRunning(true)
@@ -478,6 +531,86 @@ class MainActivity : Activity() {
         stopService(Intent(this, DiagService::class.java))
         status("转写结束")
         appendResult("\n")
+        // 基于转写结果生成面试反馈（独立线程；等 result 下行收敛后触发）
+        handler.postDelayed({ generateFeedback() }, 800)
+    }
+
+    // ---------- DeepSeek 面试反馈 ----------
+    /**
+     * 根据本轮转写文本调用 DeepSeek 生成点评与建议，SSE 流式上屏。
+     * 开发验证辅助：files/test_feedback.txt 存在且转写文本为空时，以其内容作为测试回答文本（测试后删除）。
+     */
+    private fun generateFeedback() {
+        val text = resultBuffer.toString().trim()
+        var source = "实时转写"
+        var answer = text
+        if (answer.isEmpty()) {
+            val tf = File(filesDir, "test_feedback.txt")
+            if (tf.exists()) {
+                answer = tf.readText().trim()
+                source = "测试文本"
+                log("转写文本为空，使用 test_feedback.txt 测试回答（${answer.length}字）")
+            }
+        }
+        if (answer.isEmpty()) {
+            log("本轮未识别到回答文本，跳过反馈生成")
+            appendFeedback("\n（本轮未识别到回答文本，无法生成反馈）")
+            return
+        }
+        log("生成反馈: 题目=$lastQuestion | 回答($source)=${answer.take(40)}…")
+        Thread {
+            try {
+                val payload = JSONObject().apply {
+                    put("model", DEEPSEEK_MODEL)
+                    put("temperature", 0.5)
+                    put("stream", true)
+                    put("messages", org.json.JSONArray().apply {
+                        put(JSONObject().put("role", "system").put("content", FEEDBACK_SYSTEM_PROMPT))
+                        put(JSONObject().put("role", "user").put("content",
+                            "面试问题：$lastQuestion\n候选人的回答：$answer"))
+                    })
+                }.toString()
+                val client = OkHttpClient.Builder()
+                    .connectTimeout(15, TimeUnit.SECONDS)   // 显式超时：防弱网挂起（规范 02 FR-07）
+                    .readTimeout(60, TimeUnit.SECONDS)      // 流式首字等待 + 整体
+                    .build()
+                val req = Request.Builder()
+                    .url(DEEPSEEK_URL)
+                    .header("Authorization", "Bearer $DEEPSEEK_API_KEY")
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "text/event-stream")
+                    .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        log("DeepSeek HTTP ${resp.code}: ${resp.body?.string()?.take(200)}")
+                        appendFeedback("\n（反馈服务异常 HTTP ${resp.code}）")
+                        return@Thread
+                    }
+                    val reader = BufferedReader(InputStreamReader(resp.body!!.byteStream(), Charsets.UTF_8))
+                    var line: String?
+                    var first = true
+                    while (reader.readLine().also { line = it } != null) {
+                        val l = line!!
+                        if (!l.startsWith("data:")) continue
+                        val data = l.substring(5).trim()
+                        if (data == "[DONE]") break
+                        try {
+                            val delta = JSONObject(data).optJSONArray("choices")
+                                ?.optJSONObject(0)?.optJSONObject("delta")?.optString("content", "")
+                            if (!delta.isNullOrEmpty()) {
+                                if (first) { first = false; log("DeepSeek 流式开始") }
+                                appendFeedback(delta)
+                            }
+                        } catch (e: Exception) { log("SSE 解析跳过: ${e.message}") }
+                    }
+                    log("DeepSeek 流式结束")
+                }
+            } catch (e: Exception) {
+                log("DeepSeek 调用失败: ${e.message}")
+                appendFeedback("\n（反馈生成失败: ${e.message}）")
+            }
+        }.apply { isDaemon = true; name = "deepseek-feedback" }.start()
     }
 
     private fun handleXfMessage(json: String) {
