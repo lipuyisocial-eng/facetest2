@@ -12,7 +12,7 @@ object ReportStore {
         val question: String,
         val answer: String,
         val at: Long,
-        val avgScore: Int
+        val totalScore: Int
     )
 
     private fun dir(ctx: Context): File = File(ctx.filesDir, "reports").apply { if (!exists()) mkdirs() }
@@ -28,14 +28,14 @@ object ReportStore {
         }
         return try {
             File(dir(ctx), "$id.json").writeText(obj.toString())
-            Item(id, question, answer, at, avg(report))
+            Item(id, question, answer, at, total(report))
         } catch (e: Exception) {
             null
         }
     }
 
-    private fun avg(r: ReportEngine.Report): Int =
-        if (r.dims.isEmpty()) 0 else r.dims.sumOf { it.score } / r.dims.size
+    private fun total(r: ReportEngine.Report): Int =
+        if (r.dims.isEmpty()) 0 else r.dims.sumOf { it.score }.coerceIn(0, 100)
 
     fun list(ctx: Context): List<Item> {
         val files = dir(ctx).listFiles { f -> f.name.endsWith(".json") } ?: return emptyList()
@@ -44,7 +44,7 @@ object ReportStore {
                 val o = JSONObject(f.readText())
                 val rep = ReportEngine.Report.fromJson(o.getJSONObject("report").toString())
                 Item(f.nameWithoutExtension, o.optString("question"), o.optString("answer"),
-                    o.optLong("at"), if (rep == null) 0 else avg(rep))
+                    o.optLong("at"), if (rep == null) 0 else total(rep))
             } catch (e: Exception) {
                 null
             }

@@ -203,7 +203,7 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v1.8.0（在线视觉识别 · 六维雷达图）")
+        log("应用启动 v1.9.0（五维20分制 · 理解中进度 · 雷达图）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         loadCorpus()
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
@@ -214,7 +214,9 @@ class MainActivity : Activity() {
                 Thread {
                     try {
                         val f = File(filesDir, name)
-                        val r = DocumentParser.parse(this, android.net.Uri.fromFile(f), name)
+                        val r = DocumentParser.parse(this, android.net.Uri.fromFile(f), name) { msg ->
+                            log("导入进度: $msg")
+                        }
                         val doc = DocumentStore.add(this, name, r.method, r.text)
                         log("DEBUG KB 导入: $name method=${r.method} pages=${r.pages} chars=${r.text.length} saved=${doc != null} 前60字=${r.text.take(60).replace("\n", " ")}")
                     } catch (e: Exception) {
@@ -240,7 +242,9 @@ class MainActivity : Activity() {
                             return@Thread
                         }
                         val f = File(path)
-                        val r = DocumentParser.parse(this, android.net.Uri.fromFile(f), f.name)
+                        val r = DocumentParser.parse(this, android.net.Uri.fromFile(f), f.name) { msg ->
+                            log("导入进度: $msg")
+                        }
                         log("DEBUG OCR 解析: ${f.name} method=${r.method} pages=${r.pages} chars=${r.text.length} 前80字=${r.text.take(80).replace("\n", " ")}")
                     } catch (e: Exception) {
                         log("DEBUG OCR 异常: ${e.javaClass.simpleName} ${e.message}")
@@ -662,10 +666,14 @@ class MainActivity : Activity() {
         val uri = data?.data ?: return
         val docName = queryDisplayName(uri)
         log("开始导入资料: $docName")
-        status("解析资料中…")
+        status("理解中…")
+        val progressDlg = showUnderstanding()
         Thread {
             try {
-                val parsed = DocumentParser.parse(this, uri, docName)
+                val parsed = DocumentParser.parse(this, uri, docName) { msg ->
+                    log("导入进度: $msg")
+                    handler.post { progressDlg.second.text = msg }
+                }
                 if (parsed.text.isBlank()) {
                     handler.post {
                         log("资料解析为空: $docName method=${parsed.method}")
@@ -675,6 +683,7 @@ class MainActivity : Activity() {
                 }
                 val doc = DocumentStore.add(this, docName, parsed.method, parsed.text)
                 handler.post {
+                    progressDlg.first.dismiss()
                     if (doc == null) {
                         status("资料保存失败")
                         return@post
@@ -685,11 +694,42 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) {
                 handler.post {
+                    progressDlg.first.dismiss()
                     log("资料导入失败: ${e.javaClass.simpleName} ${e.message}")
                     status("资料导入失败: ${e.message}")
                 }
             }
         }.apply { isDaemon = true; name = "doc-parse" }.start()
+    }
+
+    /** 「理解中」进度弹窗：进度条 + 动态文案（PDF 逐页更新） */
+    private fun showUnderstanding(): Pair<AlertDialog, TextView> {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(28), dp(24), dp(28), dp(22))
+            background = rounded(C.CARD, C.STROKE, 22)
+        }
+        val bar = android.widget.ProgressBar(this).apply {
+            isIndeterminate = true
+            indeterminateTintList = ColorStateList.valueOf(C.ACCENT)
+        }
+        val tv = TextView(this).apply {
+            text = "理解中…"
+            textSize = 14f
+            setTextColor(C.TEXT)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, 0)
+        }
+        box.addView(bar, LinearLayout.LayoutParams(dp(48), dp(48)))
+        box.addView(tv)
+        val dlg = AlertDialog.Builder(this).setView(box).setCancelable(false).create()
+        dlg.setOnShowListener {
+            dlg.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
+            dlg.window?.setLayout(dp(240), android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        dlg.show()
+        return dlg to tv
     }
 
     private fun queryDisplayName(uri: Uri): String {
@@ -842,6 +882,10 @@ class MainActivity : Activity() {
             color = 0xFF8FA69B.toInt()
         }
         private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF5F7A6E.toInt() }
+        private val tickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = 24f
+            color = 0x88A9A29A.toInt()
+        }
         private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             textSize = 30f
             color = 0xFF6E6A64.toInt()
@@ -872,6 +916,11 @@ class MainActivity : Activity() {
                 path.close()
                 canvas.drawPath(path, gridPaint)
             }
+            // 刻度（沿正上方轴，标 5/10/15；最外层 20 由轴端隐含，避开顶点标签）
+            for (layer in 1..3) {
+                val r = radius * layer / 4f
+                canvas.drawText("${layer * 5}", cx + 8f, cy - r + 4f, tickPaint)
+            }
             // 轴线
             for (i in 0 until n) {
                 val a = -Math.PI / 2 + step * i
@@ -881,7 +930,7 @@ class MainActivity : Activity() {
             // 分数多边形
             val fp = android.graphics.Path()
             for (i in 0 until n) {
-                val v = (dims[i].score.coerceIn(0, 100)) / 100f
+                val v = (dims[i].score.coerceIn(0, 20)) / 20f
                 val a = -Math.PI / 2 + step * i
                 val x = cx + (radius * v * Math.cos(a)).toFloat()
                 val y = cy + (radius * v * Math.sin(a)).toFloat()
@@ -893,7 +942,7 @@ class MainActivity : Activity() {
             // 顶点 + 标签
             for (i in 0 until n) {
                 val a = -Math.PI / 2 + step * i
-                val v = (dims[i].score.coerceIn(0, 100)) / 100f
+                val v = (dims[i].score.coerceIn(0, 20)) / 20f
                 val px = cx + (radius * v * Math.cos(a)).toFloat()
                 val py = cy + (radius * v * Math.sin(a)).toFloat()
                 canvas.drawCircle(px, py, 5f, dotPaint)
@@ -1559,9 +1608,9 @@ class MainActivity : Activity() {
             val item = ReportStore.save(this, q, a, r)
             handler.post {
                 lastReportId = item?.id
-                val avg = item?.avgScore ?: 0
-                log("复盘已生成: 均分=$avg 维度=${r.dims.joinToString { "${it.name}${it.score}" }}")
-                appendFeedback("\n\n▸ 六维复盘已生成（均分 $avg），点此卡片查看")
+                val total = item?.totalScore ?: 0
+                log("复盘已生成: 总分=$total/100 维度=${r.dims.joinToString { "${it.name}${it.score}" }}")
+                appendFeedback("\n\n▸ 五维复盘已生成（总分 $total/100），点此卡片查看")
             }
         }.apply { isDaemon = true; name = "report-gen" }.start()
     }
@@ -1597,7 +1646,7 @@ class MainActivity : Activity() {
         } else {
             items.take(12).forEach { item ->
                 box.addView(TextView(this).apply {
-                    text = "${item.question.take(18)}  ·  均分 ${item.avgScore}"
+                    text = "${item.question.take(18)}  ·  总分 ${item.totalScore}/100"
                     textSize = 13f
                     setTextColor(C.TEXT)
                     setPadding(0, dp(10), 0, dp(10))
@@ -1641,7 +1690,7 @@ class MainActivity : Activity() {
             background = rounded(C.CARD, C.STROKE, 24)
         }
         box.addView(TextView(this).apply {
-            text = "六维复盘"
+            text = "五维复盘"
             textSize = 18f
             setTextColor(C.TEXT)
             typeface = Typeface.DEFAULT_BOLD
@@ -1657,6 +1706,13 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(230))
         })
+        box.addView(TextView(this).apply {
+            text = "每项满分 20 分，合计 100 分 ｜ 内容完整度 · 数据可信度 · 逻辑与防御（含追问）· 表达结构 · 时间控制"
+            textSize = 10f
+            setTextColor(C.LABEL)
+            setLineSpacing(dp(2).toFloat(), 1.3f)
+            setPadding(dp(2), 0, dp(2), dp(6))
+        })
         rep.dims.forEach { d ->
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
@@ -1669,7 +1725,7 @@ class MainActivity : Activity() {
                 setTextColor(C.TEXT)
             }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             head.addView(TextView(this).apply {
-                text = "${d.score}"
+                text = "${d.score}/20"
                 textSize = 13f
                 setTextColor(C.ACCENT_SOFT)
                 typeface = Typeface.DEFAULT_BOLD
@@ -1683,7 +1739,7 @@ class MainActivity : Activity() {
             bar.addView(View(this).apply { background = rounded(C.ACCENT, null, 4) },
                 LinearLayout.LayoutParams(0, dp(6), d.score.toFloat().coerceAtLeast(1f)))
             bar.addView(View(this).apply { background = rounded(0xFFEDE8E0.toInt(), null, 4) },
-                LinearLayout.LayoutParams(0, dp(6), (100 - d.score).toFloat().coerceAtLeast(1f)))
+                LinearLayout.LayoutParams(0, dp(6), (20 - d.score).coerceAtLeast(1).toFloat()))
             row.addView(bar)
             row.addView(TextView(this).apply {
                 text = d.comment

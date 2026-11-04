@@ -36,16 +36,20 @@ object DocumentParser {
             .build()
     }
 
-    fun parse(ctx: Context, uri: Uri, displayName: String): Parsed {
+    fun parse(ctx: Context, uri: Uri, displayName: String, onProgress: ((String) -> Unit)? = null): Parsed {
         val lower = displayName.lowercase()
         return when {
             lower.endsWith(".txt") || lower.endsWith(".md") -> {
                 val t = ctx.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }.orEmpty()
                 Parsed(t, 1, "txt")
             }
-            lower.endsWith(".docx") -> Parsed(parseDocx(ctx, uri), 1, "docx")
-            lower.endsWith(".pdf") -> parsePdf(ctx, uri)
+            lower.endsWith(".docx") -> {
+                onProgress?.invoke("理解中…")
+                Parsed(parseDocx(ctx, uri), 1, "docx")
+            }
+            lower.endsWith(".pdf") -> parsePdf(ctx, uri, onProgress)
             lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".webp") -> {
+                onProgress?.invoke("理解中…")
                 val bmp = decodeScaled(ctx, uri, 1600) ?: return Parsed("", 0, "image")
                 val text = visionOcr(bmp)
                 bmp.recycle()
@@ -91,7 +95,7 @@ object DocumentParser {
     }
 
     /** PDF：PdfRenderer 渲染每页（缩到 1600px 内）→ 在线视觉识别，最多 10 页 */
-    private fun parsePdf(ctx: Context, uri: Uri): Parsed {
+    private fun parsePdf(ctx: Context, uri: Uri, onProgress: ((String) -> Unit)? = null): Parsed {
         val pfd: ParcelFileDescriptor = ctx.contentResolver.openFileDescriptor(uri, "r")
             ?: return Parsed("", 0, "pdf")
         val sb = StringBuilder()
@@ -100,6 +104,7 @@ object DocumentParser {
             PdfRenderer(pfd).use { renderer ->
                 val n = minOf(renderer.pageCount, 10)
                 for (i in 0 until n) {
+                    onProgress?.invoke("理解中… 第 ${i + 1}/${n} 页")
                     renderer.openPage(i).use { page ->
                         val scale = 2f
                         val w = (page.width * scale).toInt().coerceAtLeast(1)
