@@ -155,6 +155,7 @@ class MainActivity : Activity() {
     private var speechHoldUntil = 0L
     private val recentInterviewer = ArrayList<Pair<String, Long>>()
     private val recentSpoken = ArrayList<Pair<String, Long>>()
+    private val assistBuffer = StringBuilder()
     private var dlgRef: AlertDialog? = null
 
     // TTS 播题
@@ -206,7 +207,7 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v3.0.0（低延迟 · 不被回声打断 · 停止即静音）")
+        log("应用启动 v3.1.0（停顿聚合 · 先判定问题再回答）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
@@ -1232,9 +1233,13 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                 return
             }
             if (t.length >= 3) {
-                log("实战模式识别到面试官说话: $t → 250ms 后生成话术")
-                handler.post { questionView.text = t }
-                scheduleStrategy(t, 250)
+                assistBuffer.append(t)
+                if (assistBuffer.length > 300) {
+                    assistBuffer.delete(0, assistBuffer.length - 300)
+                }
+                log("实战模式累积识别（${assistBuffer.length}字，停顿900ms后生成）: $t")
+                handler.post { questionView.text = assistBuffer.toString().takeLast(80) }
+                scheduleStrategy(assistBuffer.toString(), 900)
             }
         }
     }
@@ -2141,7 +2146,11 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                 log("话术就绪: 模型${advice.elapsedMs}ms / 总${total}ms | SAY=${advice.opening} | NEXT=${advice.followup}")
                 log("端到端：去抖250ms + 生成${total}ms → 开始播报")
                 Conversation.addAdvice(q, advice.opening)
+                if (assistMode) assistBuffer.setLength(0)
                 currentStrategy = advice.opening
+                if (assistMode && advice.question.isNotBlank()) {
+                    questionView.text = advice.question
+                }
                 strategyView.text = "「${advice.opening}」"
                 renderChips(advice.opening)
                 if (advice.followup.isNotBlank()) {
@@ -2303,7 +2312,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         lastSpokenText = say
         recentSpoken.add(say to SystemClock.elapsedRealtime())
         while (recentSpoken.size > 4) recentSpoken.removeAt(0)
-        speechHoldUntil = SystemClock.elapsedRealtime() + 2500
+        speechHoldUntil = SystemClock.elapsedRealtime() + 1500
         adviceStartAt = SystemClock.elapsedRealtime()
         speakStartAt = adviceStartAt
         adviceSafety?.let { handler.removeCallbacks(it) }

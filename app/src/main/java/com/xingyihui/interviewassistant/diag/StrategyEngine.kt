@@ -19,6 +19,7 @@ import java.util.concurrent.TimeUnit
 object StrategyEngine {
 
     data class Advice(
+        val question: String = "",
         val opening: String = "",
         val followup: String = "",
         val elapsedMs: Long = 0,
@@ -44,7 +45,12 @@ object StrategyEngine {
    没有用户上传资料时，SAY 用行业通用口径表述（如「按行业 85%–90% 的核销率，50 万 GTV 核销 43–45 万」），
    可以用「我们这类门店」「按行业口径」这类可复用主语，仍然要能直接说出口。
 
-只输出两行，严格用以下格式，不要任何多余文字：
+输入可能是「一段混杂的对话」：既有面试官提问，也可能包含候选人自己的话、口头语、他人插话。
+你必须先判断「面试官真正问的问题」，然后用可复用口话说出口回答；遇到「注册」这类词，结合上下文和候选人资料理解其真实含义
+（例如小程序注册、会员注册、渠道引流注册），不要望文生义。
+
+严格输出三行，不要任何多余文字：
+Q: <你判断出的面试官问题，20 字以内>
 SAY: <开场话术>
 NEXT: <预判追问与补强>
 """
@@ -159,9 +165,11 @@ SAY 必须使用可复用的行业口径主语（如「我们这类门店」「�
     private fun parse(content: String, elapsed: Long): Advice {
         var say = ""
         var next = ""
+        var q = ""
         for (line in content.lines()) {
             val t = line.trim()
             when {
+                t.startsWith("Q:") -> q = t.removePrefix("Q:").trim()
                 t.startsWith("SAY:") -> say = t.removePrefix("SAY:").trim()
                 t.startsWith("NEXT:") -> next = t.removePrefix("NEXT:").trim()
             }
@@ -170,7 +178,7 @@ SAY 必须使用可复用的行业口径主语（如「我们这类门店」「�
             // 模型没按格式时退化：取第一行非空文本
             say = content.lines().map { it.trim() }.firstOrNull { it.isNotEmpty() && !it.startsWith("NEXT:") }.orEmpty()
         }
-        return Advice(opening = clean(say), followup = clean(next), elapsedMs = elapsed)
+        return Advice(question = q.trim('「', '」'), opening = clean(say), followup = clean(next), elapsedMs = elapsed)
     }
 
     /** 去引号/前缀，截到第一句（播报只读第一句，保证 ≤5 秒） */
