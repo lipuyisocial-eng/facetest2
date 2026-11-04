@@ -209,6 +209,18 @@ class MainActivity : Activity() {
         checkRecordPermission()
         // 调试钩子：adb am start -e debug_question "问题" 可直接驱动「真人辅助」提问识别链路（仅 debug 包）
         if (BuildConfig.DEBUG) {
+            intent?.getStringExtra("debug_kb_file")?.let { name ->
+                Thread {
+                    try {
+                        val f = File(filesDir, name)
+                        val r = DocumentParser.parse(this, android.net.Uri.fromFile(f), name)
+                        val doc = DocumentStore.add(this, name, r.method, r.text)
+                        log("DEBUG KB 导入: $name method=${r.method} pages=${r.pages} chars=${r.text.length} saved=${doc != null} 前60字=${r.text.take(60).replace("\n", " ")}")
+                    } catch (e: Exception) {
+                        log("DEBUG KB 异常: ${e.javaClass.simpleName} ${e.message}")
+                    }
+                }.start()
+            }
             intent?.getStringExtra("debug_ocr")?.let { path ->
                 Thread {
                     try {
