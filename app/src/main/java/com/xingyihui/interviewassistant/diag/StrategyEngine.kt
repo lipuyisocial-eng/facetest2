@@ -203,6 +203,7 @@ SAY 必须使用可复用的行业口径主语（如「我们这类门店」「�
         var t = clean(opening)
         // 数字/单位读法顺滑：去空格、% → 百分之、比例冒号 → 比、顿号 → 逗号、括号去掉
         t = t.replace(Regex("\\s+"), "")
+        t = t.replace(Regex("(\\d+(?:\\.\\d+)?)\\s*[%％]"), "百分之$1")
         t = t.replace("％", "百分之").replace("%", "百分之")
         t = t.replace("：", "比").replace(":", "比")
         t = t.replace("、", "，")

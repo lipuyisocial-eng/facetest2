@@ -215,7 +215,7 @@ class MainActivity : Activity() {
         // 不主动点亮屏幕/不覆盖锁屏，避免放裤兜时误触
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v3.4.0（防重复播报 · 音色可选 · 数字顺读）")
+        log("应用启动 v3.5.0（自然音色 · 语速音调预设 · 防重复）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         try {
@@ -1037,15 +1037,49 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                 status("系统没有可用的中文音色")
                 return@entry
             }
-            val names = voices.map { "${it.name}（${if (it.isNetworkConnectionRequired) "在线" else "本地"}）" }.toTypedArray()
+            val presets = listOf("系统默认（最自然）", "温柔（语速慢一点、音调低一点）", "清亮（语速快一点、音调高一点）")
+            val names = (presets + voices.map {
+                "${it.name}（${if (it.isNetworkConnectionRequired) "在线" else "本地"}）"
+            }).toTypedArray()
             AlertDialog.Builder(this)
                 .setTitle("选择播报音色")
                 .setItems(names) { _, which ->
-                    val v = voices[which]
-                    Prefs.setVoice(this, v.name)
-                    try { tts?.voice = v; tts?.setPitch(1.0f) } catch (_: Exception) {}
-                    log("音色已切换: ${v.name} (${v.locale})")
-                    status("音色已切换：${v.name}")
+                    when (which) {
+                        0 -> {
+                            Prefs.setVoice(this, "")
+                            log("音色选择: 系统默认")
+                            status("已选：系统默认音色")
+                            speakInterviewer("这是系统默认音色的试听，五十万预算，核销率百分之八十七。")
+                            return@setItems
+                        }
+                        1 -> {
+                            Prefs.setVoice(this, "preset:soft")
+                            log("音色选择: 温柔预设")
+                            status("已选：温柔预设")
+                            speakInterviewer("这是温柔预设的试听，五十万预算，核销率百分之八十七。")
+                            return@setItems
+                        }
+                        2 -> {
+                            Prefs.setVoice(this, "preset:bright")
+                            log("音色选择: 清亮预设")
+                            status("已选：清亮预设")
+                            speakInterviewer("这是清亮预设的试听，五十万预算，核销率百分之八十七。")
+                            return@setItems
+                        }
+                    }
+                    val v = voices[which - 3]
+                    Prefs.setVoice(this, "voice:" + v.name)
+                    try {
+                        tts?.setLanguage(v.locale)
+                        tts?.voice = v
+                        log("音色已切换: ${v.name} (${v.locale}) 生效=${tts?.voice?.name}")
+                        tts?.voices?.firstOrNull { it.name == v.name }?.let {
+                            log("音色参数: 需联网=${it.isNetworkConnectionRequired} 特性=${it.features}")
+                        }
+                    } catch (e: Exception) {
+                        log("音色切换失败: ${e.message}")
+                    }
+                    status("音色已切换：${v.name}（实际生效：${tts?.voice?.name}）")
                     speakInterviewer("这是新音色的试听，数字比如五十万、百分之八十七。")
                 }
                 .setNegativeButton("取消", null)
@@ -1456,15 +1490,9 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                 if (status == TextToSpeech.SUCCESS) {
                     ttsReady = true
                     val lang = tts?.setLanguage(Locale.CHINA)
-                    tts?.setSpeechRate(1.1f) // 播报速度
-                    val savedVoice = Prefs.voice(this@MainActivity)
-                    if (savedVoice.isNotBlank()) {
-                        tts?.voices?.firstOrNull { it.name == savedVoice }?.let { v ->
-                            tts?.voice = v
-                            log("应用已保存音色: ${v.name} (${v.locale})")
-                        }
-                    }
-                    tts?.setPitch(1.0f)
+                    // 不改语速/音高，保留引擎默认（更自然）
+                    applyVoiceSelection()
+                    log("应用已保存音色选择: ${Prefs.voice(this@MainActivity).ifBlank { "系统默认" }}")
                     log("TTS 初始化成功；setLanguage(zh_CN)=$lang")
                 } else {
                     log("TTS 初始化失败 status=$status（检查系统 TTS 引擎与语音包）")
@@ -2459,6 +2487,33 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         speakStrategy(s)
     }
 
+    /** 应用用户在设置里选的音色/预设（voice:名称 或 preset:soft/bright） */
+    private fun applyVoiceSelection() {
+        val sel = Prefs.voice(this)
+        try {
+            when {
+                sel.startsWith("preset:soft") -> {
+                    tts?.setSpeechRate(0.95f); tts?.setPitch(0.95f)
+                }
+                sel.startsWith("preset:bright") -> {
+                    tts?.setSpeechRate(1.05f); tts?.setPitch(1.06f)
+                }
+                sel.startsWith("voice:") -> {
+                    val name = sel.removePrefix("voice:")
+                    tts?.voices?.firstOrNull { it.name == name }?.let { v ->
+                        tts?.setLanguage(v.locale)
+                        tts?.voice = v
+                    }
+                    tts?.setSpeechRate(1.0f); tts?.setPitch(1.0f)
+                }
+                else -> {
+                    // 系统默认：完全交给引擎
+                    tts?.setSpeechRate(1.0f); tts?.setPitch(1.0f)
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
     private fun speakStrategy(text: String) {
         if (!transcribing) {
             log("会话已停止，丢弃迟到的话术播报")
@@ -2471,9 +2526,8 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         val say = StrategyEngine.speechText(text)
         adviceSpeaking = true
         lastSpeakAt = SystemClock.elapsedRealtime()
-        try { tts?.setPitch(1.0f) } catch (_: Exception) {}
-        try { tts?.setSpeechRate(1.05f) } catch (_: Exception) {}
-        log("播报音色: ${tts?.voice?.name} / engine=${tts?.defaultEngine}")
+        applyVoiceSelection()
+        log("播报音色: ${tts?.voice?.name} / engine=${tts?.defaultEngine} / 选择=${Prefs.voice(this)}")
         lastSpokenText = say
         recentSpoken.add(say to SystemClock.elapsedRealtime())
         while (recentSpoken.size > 4) recentSpoken.removeAt(0)
