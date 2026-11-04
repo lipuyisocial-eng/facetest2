@@ -81,6 +81,31 @@ class MainActivity : Activity() {
             "你是资深面试官。根据候选人对面试问题的回答，用中文给出简短点评：先说1句优点，" +
             "再说1-2句可改进的具体建议。直接输出内容，不要客套，不要使用markdown符号，不超过120字。"
 
+        // 知识库语料（assets/corpus/*.txt，由 CC014 面试语料按主题切分生成，合计约 136KB）
+        private val CORPUS_TOPICS = arrayOf(
+            "zwojieshao", "lizhiyuanyin", "youquedian", "xinzidaiyu", "zhiyeguihua",
+            "jiaban", "yingsheng", "tiaocao", "yali", "tuandui", "xiangmu",
+            "fanwen", "kongchuan", "qiweifan", "tongxue"
+        )
+        // 主题 → 命中关键词（题目/回答中出现即注入对应语料要点）
+        private val CORPUS_KEYWORDS = mapOf(
+            "zwojieshao" to arrayOf("自我介绍", "介绍一下自己", "做个自我介绍"),
+            "lizhiyuanyin" to arrayOf("离职原因", "为什么离职", "离开上家", "上家公司"),
+            "youquedian" to arrayOf("优点", "缺点", "优势", "劣势", "不足", "长处"),
+            "xinzidaiyu" to arrayOf("薪资", "工资", "薪酬", "待遇", "期望薪资", "薪水"),
+            "zhiyeguihua" to arrayOf("职业规划", "职业发展", "未来规划", "长期规划", "发展目标"),
+            "jiaban" to arrayOf("加班", "996", "工作强度"),
+            "yingsheng" to arrayOf("应届", "校招", "毕业生", "刚毕业", "实习"),
+            "tiaocao" to arrayOf("跳槽", "频繁换工作", "换了几份"),
+            "yali" to arrayOf("压力", "抗压", "焦虑"),
+            "tuandui" to arrayOf("团队", "协作", "合作", "同事", "沟通", "冲突"),
+            "xiangmu" to arrayOf("项目经验", "做过什么项目", "项目经历", "负责过", "做过哪些"),
+            "fanwen" to arrayOf("你有什么问题", "反问", "还有什么想问"),
+            "kongchuan" to arrayOf("空窗期", "断档", "没有工作", "待业"),
+            "qiweifan" to arrayOf("为什么选择我们", "为什么来我们", "了解我们公司", "期望"),
+            "tongxue" to arrayOf("住在哪里", "通勤", "爱好", "兴趣", "性格", "老家")
+        )
+
         private val QUESTIONS = arrayOf(
             "请先做个简短的自我介绍。",
             "你的主要优点和缺点是什么？",
@@ -135,8 +160,9 @@ class MainActivity : Activity() {
         setShowWhenLocked(true)
         setTurnScreenOn(true)
         buildUi()
-        log("应用启动 v1.0.0（正式版·实时转写）")
+        log("应用启动 v1.4.0（正式版·实时转写·知识库）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
+        loadCorpus()
         checkRecordPermission()
     }
 
@@ -285,6 +311,39 @@ class MainActivity : Activity() {
     }
 
     private fun log(msg: String) = Log.i(TAG, msg)
+
+    // ---------- 知识库语料（CC014 面试语料，assets/corpus/*.txt） ----------
+    private val corpusCache = HashMap<String, String>()
+
+    private fun loadCorpus() {
+        try {
+            for (topic in CORPUS_TOPICS) {
+                val path = "corpus/$topic.txt"
+                val text = assets.open(path).bufferedReader(Charsets.UTF_8).use { it.readText() }
+                if (text.isNotBlank()) corpusCache[topic] = text
+            }
+            log("知识库语料加载完成: ${corpusCache.size}/${CORPUS_TOPICS.size} 个主题")
+        } catch (e: Exception) {
+            log("知识库语料加载失败: ${e.message}")
+        }
+    }
+
+    /** 题目/回答关键词命中知识库主题 → 返回注入用的要点片段（最多 2 主题，每段 ≤900 字） */
+    private fun matchCorpus(question: String, answer: String): String {
+        val haystack = "$question $answer"
+        val hits = LinkedHashSet<String>()
+        for ((topic, kws) in CORPUS_KEYWORDS) {
+            if (hits.size >= 2) break
+            if (kws.any { haystack.contains(it) }) hits.add(topic)
+        }
+        if (hits.isEmpty()) return ""
+        val sb = StringBuilder("\n\n【参考要点（来自面试知识库，仅作点评依据，不要照抄）】\n")
+        for (t in hits) {
+            val c = corpusCache[t]
+            if (!c.isNullOrBlank()) sb.append("[$t] ").append(c.take(900)).append("\n")
+        }
+        return sb.toString()
+    }
 
     private fun status(msg: String) { handler.post { statusView.text = msg } }
 
@@ -583,6 +642,9 @@ class MainActivity : Activity() {
             return
         }
         log("生成反馈: 题目=$lastQuestion | 回答($source)=${answer.take(40)}…")
+        // 知识库命中注入：题目+回答关键词 → 语料要点拼进 system prompt
+        val tips = matchCorpus(lastQuestion, answer)
+        if (tips.isNotEmpty()) log("知识库命中，注入参考要点 ${tips.length} 字")
         Thread {
             try {
                 val payload = JSONObject().apply {
@@ -590,7 +652,7 @@ class MainActivity : Activity() {
                     put("temperature", 0.5)
                     put("stream", true)
                     put("messages", org.json.JSONArray().apply {
-                        put(JSONObject().put("role", "system").put("content", FEEDBACK_SYSTEM_PROMPT))
+                        put(JSONObject().put("role", "system").put("content", FEEDBACK_SYSTEM_PROMPT + tips))
                         put(JSONObject().put("role", "user").put("content",
                             "面试问题：$lastQuestion\n候选人的回答：$answer"))
                     })
