@@ -22,13 +22,13 @@ android {
         applicationId = "com.xingyihui.interviewassistant.diag"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.2.0"
+        versionCode = 4
+        versionName = "1.4.0"
 
         buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepseekKey\"")
         buildConfigField("String", "XF_API_SECRET", "\"$xfApiSecret\"")
         buildConfigField("String", "XF_APP_ID", "\"6eb32081\"")
-        buildConfigField("String", "XF_API_KEY", "\"9f15c5590c9bcb7ed781a8a6a4f61281\"")
+        buildConfigField("String", "XF_API_KEY", "\"876f9549559a4592a7fc8195fbbe343b\"")
     }
 
     buildTypes {
