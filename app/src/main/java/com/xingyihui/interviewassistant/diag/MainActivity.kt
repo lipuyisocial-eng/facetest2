@@ -151,6 +151,7 @@ class MainActivity : Activity() {
     private var lastIgnoreReason = ""
     private var adviceStartAt = 0L
     private var adviceSafety: Runnable? = null
+    private var lastSpokenText = ""
     private var dlgRef: AlertDialog? = null
 
     // TTS 播题
@@ -202,7 +203,7 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v2.7.0（播报自愈+诊断测试）")
+        log("应用启动 v2.8.0（回声/新提问区分）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
@@ -1162,10 +1163,24 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         lastRecognized = t
         if (assistMode) {
             val now = SystemClock.elapsedRealtime()
-            if (adviceSpeaking || now < adviceCooldownUntil) {
+            if (adviceSpeaking) {
+                // 和正在播报的话术高度重合 → 是外放回声，忽略；否则是面试官新提问 → 打断播报去回答
+                val sim = if (lastSpokenText.isBlank()) 0.0 else charOverlap(lastSpokenText, t)
+                if (sim >= 0.45) {
+                    ignoreCount++
+                    lastIgnoreReason = "回声(sim=${"%.2f".format(sim)})"
+                    log("忽略回声（相似度 ${"%.2f".format(sim)}）: $t")
+                    return
+                }
+                log("检测到面试官新提问（与播报相似度 ${"%.2f".format(sim)}），打断播报: $t")
+                try { tts?.stop() } catch (_: Exception) {}
+                adviceSpeaking = false
+                adviceSafety?.let { handler.removeCallbacks(it) }
+            }
+            if (now < adviceCooldownUntil) {
                 ignoreCount++
-                lastIgnoreReason = if (adviceSpeaking) "播报中(${now - adviceStartAt}ms)" else "冷却中"
-                log("忽略识别（$lastIgnoreReason）: $t")
+                lastIgnoreReason = "冷却中"
+                log("忽略识别（冷却中）: $t")
                 return
             }
             if (t.length >= 3) {
@@ -2215,6 +2230,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         }
         val say = StrategyEngine.speechText(text)
         adviceSpeaking = true
+        lastSpokenText = say
         adviceStartAt = SystemClock.elapsedRealtime()
         speakStartAt = adviceStartAt
         adviceSafety?.let { handler.removeCallbacks(it) }
