@@ -203,7 +203,7 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v1.7.0（多轮上下文 · 资料库 · 六维复盘）")
+        log("应用启动 v1.8.0（在线视觉识别 · 六维雷达图）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         loadCorpus()
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
@@ -235,7 +235,7 @@ class MainActivity : Activity() {
                             }
                             canvas.drawText("端艾堂2024年总营收2053万", 40f, 80f, paint)
                             canvas.drawText("美团投放6万 GTV50万", 40f, 160f, paint)
-                            val txt = DocumentParser.ocrBitmapForTest(bmp)
+                            val txt = DocumentParser.visionOcr(bmp)
                             log("DEBUG OCR(draw) chars=${txt.length} 内容=${txt.replace("\n", " ").take(80)}")
                             return@Thread
                         }
@@ -819,6 +819,93 @@ class MainActivity : Activity() {
             dlg.window?.setLayout(dp(340), android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
         }
         dlg.show()
+    }
+
+    /** F5 六维雷达图：6 轴六边形网格 + 分数多边形 */
+    private class RadarView(ctx: Context, private val dims: List<ReportEngine.Dim>) : View(ctx) {
+        private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 2f
+            color = 0x33A9A29A
+        }
+        private val axisPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            strokeWidth = 2f
+            color = 0x26A9A29A
+        }
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = 0x558FA69B
+        }
+        private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 4f
+            color = 0xFF8FA69B.toInt()
+        }
+        private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF5F7A6E.toInt() }
+        private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = 30f
+            color = 0xFF6E6A64.toInt()
+        }
+        private val scorePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = 28f
+            color = 0xFF5F7A6E.toInt()
+            typeface = Typeface.DEFAULT_BOLD
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val n = dims.size.coerceAtLeast(3)
+            val cx = width / 2f
+            val cy = height / 2f + 4
+            val radius = minOf(width, height) / 2f - 56f
+            val step = Math.PI * 2 / n
+
+            // 网格 4 层
+            for (layer in 1..4) {
+                val r = radius * layer / 4f
+                val path = android.graphics.Path()
+                for (i in 0 until n) {
+                    val a = -Math.PI / 2 + step * i
+                    val x = cx + (r * Math.cos(a)).toFloat()
+                    val y = cy + (r * Math.sin(a)).toFloat()
+                    if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                }
+                path.close()
+                canvas.drawPath(path, gridPaint)
+            }
+            // 轴线
+            for (i in 0 until n) {
+                val a = -Math.PI / 2 + step * i
+                canvas.drawLine(cx, cy,
+                    cx + (radius * Math.cos(a)).toFloat(), cy + (radius * Math.sin(a)).toFloat(), axisPaint)
+            }
+            // 分数多边形
+            val fp = android.graphics.Path()
+            for (i in 0 until n) {
+                val v = (dims[i].score.coerceIn(0, 100)) / 100f
+                val a = -Math.PI / 2 + step * i
+                val x = cx + (radius * v * Math.cos(a)).toFloat()
+                val y = cy + (radius * v * Math.sin(a)).toFloat()
+                if (i == 0) fp.moveTo(x, y) else fp.lineTo(x, y)
+            }
+            fp.close()
+            canvas.drawPath(fp, fillPaint)
+            canvas.drawPath(fp, linePaint)
+            // 顶点 + 标签
+            for (i in 0 until n) {
+                val a = -Math.PI / 2 + step * i
+                val v = (dims[i].score.coerceIn(0, 100)) / 100f
+                val px = cx + (radius * v * Math.cos(a)).toFloat()
+                val py = cy + (radius * v * Math.sin(a)).toFloat()
+                canvas.drawCircle(px, py, 5f, dotPaint)
+                val lx = cx + ((radius + 34f) * Math.cos(a)).toFloat()
+                val ly = cy + ((radius + 34f) * Math.sin(a)).toFloat()
+                val text = dims[i].name
+                val tw = labelPaint.measureText(text)
+                canvas.drawText(text, lx - tw / 2, ly + 8f, labelPaint)
+                val sText = dims[i].score.toString()
+                canvas.drawText(sText, lx - scorePaint.measureText(sText) / 2, ly + 36f, scorePaint)
+            }
+        }
     }
 
     /** 简易音量波形：随录音 RMS 更新 */
@@ -1563,7 +1650,12 @@ class MainActivity : Activity() {
             text = q
             textSize = 12f
             setTextColor(C.DIM)
-            setPadding(0, dp(4), 0, dp(8))
+            setPadding(0, dp(4), 0, dp(4))
+        })
+        // 六维雷达图
+        box.addView(RadarView(this, rep.dims).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(230))
         })
         rep.dims.forEach { d ->
             val row = LinearLayout(this).apply {

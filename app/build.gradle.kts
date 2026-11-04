@@ -22,8 +22,8 @@ android {
         applicationId = "com.xingyihui.interviewassistant.diag"
         minSdk = 26
         targetSdk = 34
-        versionCode = 8
-        versionName = "1.7.0"
+        versionCode = 9
+        versionName = "1.8.0"
 
         buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepseekKey\"")
         buildConfigField("String", "XF_API_SECRET", "\"$xfApiSecret\"")
@@ -51,6 +51,4 @@ android {
 dependencies {
     // Test E 讯飞实时转写：WebSocket 客户端（okhttp 4.x）
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    // F2 资料解析：中文 OCR（离线内置模型，覆盖截图与扫描版 PDF）
-    implementation("com.google.mlkit:text-recognition-chinese:16.0.0")
 }
