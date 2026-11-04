@@ -1917,6 +1917,9 @@ class MainActivity : Activity() {
         val label = if (kind == "深挖") "追问" else "第${roundNo}题"
         handler.post {
             questionView.text = "$label：$text"
+            currentStrategy = ""
+            chipsRow.removeAllViews()
+            chipsRow.visibility = View.GONE
             strategyView.text = if (assistMode) "听到提问后自动生成可直接说出口的话术并播报。"
             else "回答后给出参考话术与下一题。"
             nextCard.visibility = View.GONE
