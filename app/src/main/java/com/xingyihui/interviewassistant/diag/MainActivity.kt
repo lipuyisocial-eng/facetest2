@@ -2,6 +2,9 @@ package com.xingyihui.interviewassistant.diag
 
 import android.Manifest
 import android.app.AlertDialog
+import android.content.Intent
+import android.net.Uri
+import android.provider.OpenableColumns
 import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Canvas
@@ -12,7 +15,6 @@ import android.graphics.drawable.GradientDrawable
 import android.view.Gravity
 import android.widget.SeekBar
 import android.app.Activity
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -75,6 +77,7 @@ class MainActivity : Activity() {
         private const val CHANNEL = AudioFormat.CHANNEL_IN_MONO
         private const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
         private const val REQ_RECORD_AUDIO = 100
+        private const val REQ_DOC = 200
         private const val MAX_DURATION_MS = 60_000L // 单次答题上限：60s 自动结束（防异常悬挂）
 
         // 讯飞实时转写大模型（rtasr_llm，用户 2026-11-04 开通）—— APP_ID/API_KEY 内置 APK（控制台 rtasr_llm 产品页 WebAPI 认证）；
@@ -148,6 +151,7 @@ class MainActivity : Activity() {
     private lateinit var feedbackCard: LinearLayout
     private lateinit var waveView: WaveView
     private var assistMode = false
+    private var lastReportId: String? = null
 
     // TTS 播题
     private var tts: TextToSpeech? = null
@@ -198,13 +202,38 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v1.5.0（HUD 界面 · 实时话术 · 语音播报）")
+        log("应用启动 v1.6.0（资料库 · 实时话术 · 六维复盘）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         loadCorpus()
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
         checkRecordPermission()
         // 调试钩子：adb am start -e debug_question "问题" 可直接驱动「真人辅助」提问识别链路（仅 debug 包）
         if (BuildConfig.DEBUG) {
+            intent?.getStringExtra("debug_ocr")?.let { path ->
+                Thread {
+                    try {
+                        if (path == "draw") {
+                            val bmp = android.graphics.Bitmap.createBitmap(900, 260, android.graphics.Bitmap.Config.ARGB_8888)
+                            val canvas = android.graphics.Canvas(bmp)
+                            canvas.drawColor(android.graphics.Color.WHITE)
+                            val paint = android.graphics.Paint().apply {
+                                color = android.graphics.Color.BLACK
+                                textSize = 48f
+                            }
+                            canvas.drawText("端艾堂2024年总营收2053万", 40f, 80f, paint)
+                            canvas.drawText("美团投放6万 GTV50万", 40f, 160f, paint)
+                            val txt = DocumentParser.ocrBitmapForTest(bmp)
+                            log("DEBUG OCR(draw) chars=${txt.length} 内容=${txt.replace("\n", " ").take(80)}")
+                            return@Thread
+                        }
+                        val f = File(path)
+                        val r = DocumentParser.parse(this, android.net.Uri.fromFile(f), f.name)
+                        log("DEBUG OCR 解析: ${f.name} method=${r.method} pages=${r.pages} chars=${r.text.length} 前80字=${r.text.take(80).replace("\n", " ")}")
+                    } catch (e: Exception) {
+                        log("DEBUG OCR 异常: ${e.javaClass.simpleName} ${e.message}")
+                    }
+                }.start()
+            }
             intent?.getStringExtra("debug_question")?.takeIf { it.isNotBlank() }?.let { q ->
                 handler.postDelayed({
                     assistMode = true
@@ -288,15 +317,31 @@ class MainActivity : Activity() {
             background = rounded(0xFFE4EAE5.toInt(), null, 999)
             setOnClickListener { toggleMode() }
         }
+        val reportBtn = TextView(this).apply {
+            text = "复盘"
+            textSize = 12f
+            setTextColor(C.DIM)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setOnClickListener { openReportList() }
+        }
+        val docsBtn = TextView(this).apply {
+            text = "资料"
+            textSize = 12f
+            setTextColor(C.DIM)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setOnClickListener { openDocs() }
+        }
         val gear = TextView(this).apply {
             text = "设置"
             textSize = 12f
             setTextColor(C.DIM)
-            setPadding(dp(12), dp(8), dp(4), dp(8))
+            setPadding(dp(2), dp(8), dp(4), dp(8))
             setOnClickListener { openSettings() }
         }
         header.addView(brand, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         header.addView(modeChip)
+        header.addView(reportBtn)
+        header.addView(docsBtn)
         header.addView(gear)
 
         val cards = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -383,6 +428,7 @@ class MainActivity : Activity() {
         feedbackCard.addView(label("本轮复盘"))
         feedbackCard.addView(feedbackView)
         feedbackCard.visibility = View.GONE
+        feedbackCard.setOnClickListener { lastReportId?.let { openReport(it) } }
         cards.addView(feedbackCard, cardLp())
 
         val scroll = ScrollView(this).apply {
@@ -475,6 +521,174 @@ class MainActivity : Activity() {
         Prefs.setMode(this, if (assistMode) Prefs.MODE_ASSIST else Prefs.MODE_PRACTICE)
         refreshModeUi()
         log("切换模式: ${if (assistMode) "真人辅助" else "练习模式"}")
+    }
+
+    // ---------- F2 资料库（导入 / 查看 / 删除 / 检索） ----------
+    private fun openDocs() {
+        val pad = dp(18)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, dp(18), pad, dp(14))
+            background = rounded(C.CARD, C.STROKE, 24)
+        }
+        val docs = DocumentStore.list(this)
+        box.addView(TextView(this).apply {
+            text = "资料库"
+            textSize = 18f
+            setTextColor(C.TEXT)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        box.addView(TextView(this).apply {
+            text = "${docs.size} 份资料 · 共 ${DocumentStore.totalChars(this@MainActivity)} 字 · 支持 PDF / Word / TXT / 截图"
+            textSize = 11f
+            setTextColor(C.DIM)
+            setPadding(0, dp(4), 0, dp(10))
+        })
+
+        val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        if (docs.isEmpty()) {
+            listBox.addView(TextView(this).apply {
+                text = "还没有资料。导入项目 PDF / Word / 截图后，话术会优先引用里面的真实数据。"
+                textSize = 12f
+                setTextColor(C.DIM)
+                setLineSpacing(dp(3).toFloat(), 1.4f)
+                setPadding(0, dp(6), 0, dp(10))
+            })
+        } else {
+            docs.forEach { d ->
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(9), 0, dp(9))
+                }
+                row.addView(TextView(this).apply {
+                    text = d.name
+                    textSize = 13f
+                    setTextColor(C.TEXT)
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                row.addView(TextView(this).apply {
+                    text = "${d.chars}字"
+                    textSize = 11f
+                    setTextColor(C.DIM)
+                    setPadding(dp(8), 0, dp(10), 0)
+                })
+                row.addView(TextView(this).apply {
+                    text = "删除"
+                    textSize = 11f
+                    setTextColor(C.ROSE_DEEP)
+                    setPadding(dp(6), dp(4), dp(4), dp(4))
+                    setOnClickListener {
+                        DocumentStore.delete(this@MainActivity, d.id)
+                        log("资料删除: ${d.name}")
+                    }
+                })
+                listBox.addView(row)
+            }
+        }
+        box.addView(listBox)
+
+        val importBtn = TextView(this).apply {
+            text = "＋ 导入资料（PDF / Word / TXT / 截图）"
+            textSize = 14f
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.CENTER
+            background = rounded(C.ACCENT, null, 16)
+            setPadding(0, dp(13), 0, dp(13))
+            setOnClickListener { pickDocument() }
+        }
+        box.addView(importBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(12)
+        })
+
+        val close = TextView(this).apply {
+            text = "关闭"
+            textSize = 13f
+            setTextColor(C.DIM)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(12), 0, dp(6))
+            setOnClickListener { }
+        }
+        box.addView(close)
+
+        val dlg = AlertDialog.Builder(this).setView(box).create()
+        close.setOnClickListener { dlg.dismiss() }
+        dlg.setOnShowListener {
+            dlg.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
+            dlg.window?.setLayout(dp(350), android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        dlg.show()
+    }
+
+    private fun pickDocument() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
+                "application/pdf",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "text/plain",
+                "image/*"
+            ))
+        }
+        try {
+            startActivityForResult(intent, REQ_DOC)
+        } catch (e: Exception) {
+            log("打开文件选择器失败: ${e.message}")
+            status("无法打开文件选择器")
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_DOC || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val docName = queryDisplayName(uri)
+        log("开始导入资料: $docName")
+        status("解析资料中…")
+        Thread {
+            try {
+                val parsed = DocumentParser.parse(this, uri, docName)
+                if (parsed.text.isBlank()) {
+                    handler.post {
+                        log("资料解析为空: $docName method=${parsed.method}")
+                        status("解析失败：未提取到文字")
+                    }
+                    return@Thread
+                }
+                val doc = DocumentStore.add(this, docName, parsed.method, parsed.text)
+                handler.post {
+                    if (doc == null) {
+                        status("资料保存失败")
+                        return@post
+                    }
+                    log("资料导入成功: ${doc.name} | 方式=${parsed.method} 页数=${parsed.pages} 字数=${doc.chars}")
+                    status("资料已入库：${doc.name}（${doc.chars}字）")
+                    openDocs()
+                }
+            } catch (e: Exception) {
+                handler.post {
+                    log("资料导入失败: ${e.javaClass.simpleName} ${e.message}")
+                    status("资料导入失败: ${e.message}")
+                }
+            }
+        }.apply { isDaemon = true; name = "doc-parse" }.start()
+    }
+
+    private fun queryDisplayName(uri: Uri): String {
+        return try {
+            contentResolver.query(uri, null, null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (i >= 0) c.getString(i) else null
+                } else null
+            } ?: uri.lastPathSegment ?: "资料"
+        } catch (e: Exception) {
+            uri.lastPathSegment ?: "资料"
+        }
     }
 
     // ---------- 设置弹窗（阈值滑杆 / 播报开关） ----------
@@ -1006,6 +1220,8 @@ class MainActivity : Activity() {
         log("转写文本: ${committedText.length}字（过滤提问句 $droppedSentences 句）")
         // 基于转写结果生成面试反馈（独立线程；等 result 下行收敛后触发）
         handler.postDelayed({ generateFeedback() }, 800)
+        // F5：六维复盘（并行，落库后可从复盘卡进入）
+        handler.postDelayed({ generateReport() }, 1400)
     }
 
     // ---------- DeepSeek 面试反馈 ----------
@@ -1190,6 +1406,193 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- F5 六维复盘 ----------
+    private fun generateReport() {
+        val q = lastQuestion
+        val a = resultText()
+        status("生成六维复盘…")
+        log("开始生成复盘: 题目=$q | 回答${a.length}字")
+        Thread {
+            val r = ReportEngine.generate(q, a, DEEPSEEK_API_KEY)
+            if (r.error.isNotEmpty()) {
+                handler.post {
+                    log("复盘生成失败: ${r.error}")
+                    status("复盘生成失败")
+                }
+                return@Thread
+            }
+            val item = ReportStore.save(this, q, a, r)
+            handler.post {
+                lastReportId = item?.id
+                val avg = item?.avgScore ?: 0
+                log("复盘已生成: 均分=$avg 维度=${r.dims.joinToString { "${it.name}${it.score}" }}")
+                appendFeedback("\n\n▸ 六维复盘已生成（均分 $avg），点此卡片查看")
+            }
+        }.apply { isDaemon = true; name = "report-gen" }.start()
+    }
+
+    private fun openReportList() {
+        val items = ReportStore.list(this)
+        val pad = dp(18)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, dp(18), pad, dp(12))
+            background = rounded(C.CARD, C.STROKE, 24)
+        }
+        box.addView(TextView(this).apply {
+            text = "复盘记录"
+            textSize = 18f
+            setTextColor(C.TEXT)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        box.addView(TextView(this).apply {
+            text = if (items.isEmpty()) "还没有复盘记录" else "共 ${items.size} 份 · 报告只基于你的真实回答"
+            textSize = 11f
+            setTextColor(C.DIM)
+            setPadding(0, dp(4), 0, dp(10))
+        })
+        val dlg = AlertDialog.Builder(this).setView(box).create()
+        if (items.isEmpty()) {
+            box.addView(TextView(this).apply {
+                text = "答完一轮后会自动生成六维复盘，包括内容完整度、数据可信度、逻辑自洽、表达结构、追问防御、时间控制。"
+                textSize = 12f
+                setTextColor(C.DIM)
+                setLineSpacing(dp(3).toFloat(), 1.4f)
+            })
+        } else {
+            items.take(12).forEach { item ->
+                box.addView(TextView(this).apply {
+                    text = "${item.question.take(18)}  ·  均分 ${item.avgScore}"
+                    textSize = 13f
+                    setTextColor(C.TEXT)
+                    setPadding(0, dp(10), 0, dp(10))
+                    setOnClickListener {
+                        dlg.dismiss()
+                        openReport(item.id)
+                    }
+                })
+            }
+        }
+        box.addView(TextView(this).apply {
+            text = "关闭"
+            textSize = 13f
+            setTextColor(C.DIM)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(14), 0, dp(6))
+            setOnClickListener { dlg.dismiss() }
+        })
+        dlg.setOnShowListener {
+            dlg.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
+            dlg.window?.setLayout(dp(350), android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+        dlg.show()
+    }
+
+    private fun openReport(id: String) {
+        val data = ReportStore.load(this, id)
+        if (data == null) {
+            status("复盘不存在")
+            return
+        }
+        val (q, answer, rep) = data
+        if (rep == null) {
+            status("复盘解析失败")
+            return
+        }
+        val pad = dp(16)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, dp(16), pad, dp(12))
+            background = rounded(C.CARD, C.STROKE, 24)
+        }
+        box.addView(TextView(this).apply {
+            text = "六维复盘"
+            textSize = 18f
+            setTextColor(C.TEXT)
+            typeface = Typeface.DEFAULT_BOLD
+        })
+        box.addView(TextView(this).apply {
+            text = q
+            textSize = 12f
+            setTextColor(C.DIM)
+            setPadding(0, dp(4), 0, dp(8))
+        })
+        rep.dims.forEach { d ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(0, dp(6), 0, dp(6))
+            }
+            val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            head.addView(TextView(this).apply {
+                text = d.name
+                textSize = 13f
+                setTextColor(C.TEXT)
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            head.addView(TextView(this).apply {
+                text = "${d.score}"
+                textSize = 13f
+                setTextColor(C.ACCENT_SOFT)
+                typeface = Typeface.DEFAULT_BOLD
+            })
+            row.addView(head)
+            val bar = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                weightSum = 100f
+                setPadding(0, dp(4), 0, dp(3))
+            }
+            bar.addView(View(this).apply { background = rounded(C.ACCENT, null, 4) },
+                LinearLayout.LayoutParams(0, dp(6), d.score.toFloat().coerceAtLeast(1f)))
+            bar.addView(View(this).apply { background = rounded(0xFFEDE8E0.toInt(), null, 4) },
+                LinearLayout.LayoutParams(0, dp(6), (100 - d.score).toFloat().coerceAtLeast(1f)))
+            row.addView(bar)
+            row.addView(TextView(this).apply {
+                text = d.comment
+                textSize = 11f
+                setTextColor(C.BODY)
+                setLineSpacing(dp(3).toFloat(), 1.35f)
+            })
+            box.addView(row)
+        }
+        if (rep.strengths.isNotEmpty()) {
+            box.addView(TextView(this).apply {
+                text = "亮点：${rep.strengths.joinToString("；")}"
+                textSize = 12f
+                setTextColor(C.BODY)
+                setLineSpacing(dp(3).toFloat(), 1.4f)
+                setPadding(0, dp(8), 0, dp(2))
+            })
+        }
+        if (rep.improvements.isNotEmpty()) {
+            box.addView(TextView(this).apply {
+                text = "改进：${rep.improvements.joinToString("；")}"
+                textSize = 12f
+                setTextColor(C.BODY)
+                setLineSpacing(dp(3).toFloat(), 1.4f)
+                setPadding(0, dp(2), 0, dp(2))
+            })
+        }
+        if (rep.verdict.isNotBlank()) {
+            box.addView(TextView(this).apply {
+                text = "总评：${rep.verdict}"
+                textSize = 12f
+                setTextColor(C.ACCENT_SOFT)
+                setPadding(0, dp(6), 0, 0)
+            })
+        }
+        box.addView(TextView(this).apply {
+            text = "你的原话：${answer.take(60)}${if (answer.length > 60) "…" else ""}"
+            textSize = 10f
+            setTextColor(C.LABEL)
+            setPadding(0, dp(8), 0, 0)
+        })
+        val dlg = AlertDialog.Builder(this).setView(android.widget.ScrollView(this).apply { addView(box) }).create()
+        dlg.setOnShowListener {
+            dlg.window?.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
+            dlg.window?.setLayout(dp(360), dp(560))
+        }
+        dlg.show()
+    }
+
     // ---------- 博弈话术：生成 + 播报 ----------
     private var strategyJob = 0
     private var lastStrategyQuestion = ""
@@ -1247,7 +1650,10 @@ class MainActivity : Activity() {
         log("开始生成话术: $q")
         val t0 = SystemClock.elapsedRealtime()
         Thread {
-            val tips = matchCorpus(q, "")
+            val rag = DocumentStore.retrieve(this, q)
+            val corpusTips = matchCorpus(q, "")
+            val tips = rag + corpusTips
+            if (rag.isNotEmpty()) log("资料库检索命中 ${rag.length} 字（问题: $q）")
             val advice = StrategyEngine.generate(q, tips, DEEPSEEK_API_KEY)
             handler.post {
                 if (job != strategyJob) return@post
