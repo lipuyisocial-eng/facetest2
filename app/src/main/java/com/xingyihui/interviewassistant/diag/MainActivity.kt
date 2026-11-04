@@ -141,6 +141,12 @@ class MainActivity : Activity() {
     private var ttsEchoUntil = 0L
     private var lastRecognized = ""
     private var lastStrategyStatus = "未生成"
+    private var adviceSpeaking = false
+    private var adviceCooldownUntil = 0L
+    private var candidateMeaningful = 0
+    private var waitingNextQuestion = false
+    private var speakingNextQuestion = false
+    private var nextJob = 0
     private var dlgRef: AlertDialog? = null
 
     // TTS 播题
@@ -192,7 +198,7 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v2.5.0（真实回答才接话 · 诊断面板）")
+        log("应用启动 v2.6.0（防自激 · 可取消 · 资料必注入）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
@@ -1079,8 +1085,26 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
     }
 
     private fun onStartStopClicked() {
-        if (transcribing) stopTranscribe("用户点击停止")
-        else startTranscribe()
+        when {
+            transcribing -> stopTranscribe("用户点击停止")
+            waitingNextQuestion || speakingNextQuestion -> cancelNextQuestion()
+            else -> startTranscribe()
+        }
+    }
+
+    /** 取消「准备下一题」（练习模式按钮可点取消） */
+    private fun cancelNextQuestion() {
+        nextJob++
+        waitingNextQuestion = false
+        speakingNextQuestion = false
+        try { tts?.stop() } catch (_: Exception) {}
+        handler.removeCallbacksAndMessages(null)
+        handler.post {
+            setButtonRunning(false)
+            status("已取消下一题")
+            strategyView.text = "回答后给出参考话术与下一题。"
+        }
+        log("用户取消下一题")
     }
 
     private fun setButtonRunning(running: Boolean) {
@@ -1115,10 +1139,16 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         }
         committedText.append(t)
         candidateChars += t.length
+        candidateMeaningful += t.filter { "嗯啊哦呃额对好的行吧那这个就是".indexOf(it) < 0 }.length
         hasSpeech = true
         lastVoiceAt = SystemClock.elapsedRealtime()
         lastRecognized = t
         if (assistMode) {
+            val now = SystemClock.elapsedRealtime()
+            if (adviceSpeaking || now < adviceCooldownUntil) {
+                log("播报中/冷却期，忽略识别到的话（防自激）: $t")
+                return
+            }
             if (t.length >= 3) {
                 log("实战模式识别到面试官说话: $t → 600ms 后生成话术")
                 handler.post { questionView.text = t }
@@ -1232,6 +1262,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
             }
             override fun onDone(utteranceId: String?) {
                 if (utteranceId?.startsWith("next_") == true) {
+                    speakingNextQuestion = false
                     ttsEchoUntil = SystemClock.elapsedRealtime() + 1500
                     if (!assistMode && !transcribing) {
                         log("下一题播报完成，自动开始新一轮回答")
@@ -1242,6 +1273,8 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                 if (utteranceId?.startsWith("strategy_") == true) {
                     val cost = SystemClock.elapsedRealtime() - speakStartAt
                     log("话术播报完成，用时 ${cost}ms")
+                    adviceSpeaking = false
+                    adviceCooldownUntil = SystemClock.elapsedRealtime() + 1500
                     handler.post { speakStateView.text = "" }
                     return
                 }
@@ -1477,8 +1510,11 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
             hasSpeech = false
             lastVoiceAt = 0L
             candidateChars = 0
+            candidateMeaningful = 0
             if (pendingNextQuestion != null) questionSpokenAt = SystemClock.elapsedRealtime()
             handler.removeCallbacks(silenceWatcher)
+        handler.removeCallbacks(speakTicker)
+        handler.post { speakStateView.text = "" }
             handler.postDelayed(silenceWatcher, 500)
         }
         handler.postDelayed({ if (transcribing) stopTranscribe("60s 上限自动结束") }, MAX_DURATION_MS)
@@ -1499,9 +1535,10 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         if (assistMode) {
             setButtonRunning(false)
         } else {
+            waitingNextQuestion = true
             handler.post {
-                btnStart.text = "准备下一题…"
-                btnStart.isEnabled = false
+                btnStart.text = "准备下一题…（点此取消）"
+                btnStart.isEnabled = true
             }
         }
         stopService(Intent(this, DiagService::class.java))
@@ -1907,6 +1944,10 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         override fun run() {
             val sec = (SystemClock.elapsedRealtime() - speakStartAt) / 1000
             speakStateView.text = String.format(Locale.US, "VOICE %02ds", sec)
+            if (sec > 40) {
+                speakStateView.text = ""
+                return
+            }
             handler.postDelayed(this, 200)
         }
     }
@@ -1923,7 +1964,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
             if (!transcribing || assistMode) return
             val now = SystemClock.elapsedRealtime()
             if (questionSpokenAt > 0 && now - questionSpokenAt > 1500) {
-                if (hasSpeech && candidateChars >= 2 && now - lastVoiceAt >= 1200) {
+                if (hasSpeech && candidateChars >= 4 && candidateMeaningful >= 2 && now - lastVoiceAt >= 1200) {
                     log("静音 1.2s（最后回答 ${now - lastVoiceAt}ms 前，已识别 ${candidateChars} 字），自动结束本轮回答")
                     stopTranscribe("静音自动结束")
                     return
@@ -1969,10 +2010,12 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         val t0 = SystemClock.elapsedRealtime()
         Thread {
             val rag = DocumentStore.retrieve(this, q)
+            val digest = if (rag.length < 200) DocumentStore.digest(this) else ""
             val builtin = BuiltinKnowledge.retrieve(this, q)
             val history = Conversation.contextPrompt()
-            val tips = rag + builtin
+            val tips = rag + digest + builtin
             if (rag.isNotEmpty()) log("上传资料命中 ${rag.length} 字（问题: $q）")
+            if (digest.isNotEmpty()) log("上传资料未命中关键词，注入资料摘要 ${digest.length} 字")
             if (builtin.isNotEmpty()) log("内置知识库命中 ${builtin.length} 字（问题: $q）")
             if (history.isNotEmpty()) log("多轮上下文: 已有 ${Conversation.size()} 轮，注入 ${history.length} 字")
             val advice = StrategyEngine.generate(q, tips, DEEPSEEK_API_KEY, history,
@@ -2007,14 +2050,22 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
 
     /** 练习模式：基于本轮真实回答 + 资料生成下一题（深挖或切换），并播报 */
     private fun generateNextQuestion() {
+        if (!waitingNextQuestion) {
+            log("下一题任务已取消，跳过生成")
+            return
+        }
+        val job = ++nextJob
         val q = lastQuestion
         val a = resultText()
         val tGen = SystemClock.elapsedRealtime()
         log("生成下一题: 上一题=$q | 本轮回答 ${a.length} 字")
         Thread {
-            val tips = DocumentStore.retrieve(this, a.ifBlank { q }) + BuiltinKnowledge.retrieve(this, q)
+            val rag2 = DocumentStore.retrieve(this, a.ifBlank { q })
+            val tips = rag2 + (if (rag2.length < 200) DocumentStore.digest(this) else "") +
+                BuiltinKnowledge.retrieve(this, q)
             val nq = NextQuestionEngine.generate(q, a, Conversation.contextPrompt(), tips, DEEPSEEK_API_KEY, askedCount)
             handler.post {
+                if (job != nextJob || !waitingNextQuestion) return@post
                 if (nq.error.isNotEmpty() || nq.text.isBlank()) {
                     log("下一题生成失败: ${nq.error}")
                     val fallback = QUESTIONS[questionIdx % QUESTIONS.size]
@@ -2028,6 +2079,8 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
     }
 
     private fun askNextQuestion(text: String, kind: String) {
+        if (!waitingNextQuestion) return
+        waitingNextQuestion = false
         roundNo++
         askedCount++
         lastQuestion = text
@@ -2059,10 +2112,11 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
             log("TTS 未就绪，下一题仅显示")
             return
         }
+        speakingNextQuestion = true
         val r = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "next_$roundNo")
         handler.post {
-            btnStart.text = "听题中…"
-            btnStart.isEnabled = false
+            btnStart.text = "取消（听题中…）"
+            btnStart.isEnabled = true
         }
         log("播报下一题(返回=$r): $text")
     }
@@ -2075,8 +2129,9 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         val t0 = SystemClock.elapsedRealtime()
         Thread {
             val rag = DocumentStore.retrieve(this, q)
+            val digest = if (rag.length < 200) DocumentStore.digest(this) else ""
             val builtin = BuiltinKnowledge.retrieve(this, q)
-            val advice = StrategyEngine.generate(q, rag + builtin, DEEPSEEK_API_KEY,
+            val advice = StrategyEngine.generate(q, rag + digest + builtin, DEEPSEEK_API_KEY,
                 Conversation.contextPrompt(), hasUserData = DocumentStore.list(this).isNotEmpty())
             handler.post {
                 if (advice.error.isNotEmpty()) {
@@ -2131,6 +2186,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
             return
         }
         val say = StrategyEngine.speechText(text)
+        adviceSpeaking = true
         speakStartAt = SystemClock.elapsedRealtime()
         tts?.speak(say, TextToSpeech.QUEUE_FLUSH, null, "strategy_$speakStartAt")
         log("播报话术(${say.length}字): $say")

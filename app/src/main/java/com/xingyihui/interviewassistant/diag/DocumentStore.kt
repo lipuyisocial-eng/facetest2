@@ -98,6 +98,22 @@ object DocumentStore {
         return sb.toString()
     }
 
+    /** 资料摘要：不管问题是否命中关键词，都带给模型一段「用户真实资料」节选，避免只讲空话 */
+    fun digest(ctx: Context, maxChars: Int = 700): String {
+        val docs = list(ctx)
+        if (docs.isEmpty()) return ""
+        val sb = StringBuilder("\n\n【候选人上传资料节选（真实项目数据，优先引用；不要编造）】\n")
+        var used = 0
+        for (d in docs) {
+            if (used >= maxChars) break
+            val body = try { textFile(ctx, d.id).readText() } catch (e: Exception) { continue }
+            val piece = "〔${d.name}〕${body.trim().take(minOf(400, maxChars - used))}\n"
+            sb.append(piece)
+            used += piece.length
+        }
+        return sb.toString()
+    }
+
     private fun score(query: String, chunk: String): Double {
         val q = query.filter { it.isLetterOrDigit() }
         val c = chunk.filter { it.isLetterOrDigit() }
