@@ -53,7 +53,7 @@ object NextQuestionEngine {
         val body = JSONObject().apply {
             put("model", "deepseek-chat")
             put("temperature", 0.6)
-            put("max_tokens", 160)
+            put("max_tokens", 90)
             put("messages", JSONArray().apply {
                 put(JSONObject().put("role", "system").put("content", SYSTEM))
                 put(JSONObject().put("role", "user").put("content", userContent))

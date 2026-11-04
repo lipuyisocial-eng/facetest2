@@ -188,7 +188,7 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v2.3.0（练习/实战切换 · 静音自动接话）")
+        log("应用启动 v2.4.0（追问1秒 · 自动续答 · 实战即时播报）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
@@ -235,6 +235,14 @@ class MainActivity : Activity() {
                         log("DEBUG OCR 异常: ${e.javaClass.simpleName} ${e.message}")
                     }
                 }.start()
+            }
+            intent?.getStringExtra("debug_transcript")?.takeIf { it.isNotBlank() }?.let { t ->
+                handler.postDelayed({
+                    assistMode = true
+                    refreshModeUi()
+                    log("DEBUG 注入转写: $t")
+                    commitSentence(t, 0L, 0L)
+                }, 1200)
             }
             intent?.getStringExtra("debug_question")?.takeIf { it.isNotBlank() }?.let { raw ->
                 val qs = raw.split("||").map { it.trim() }.filter { it.isNotEmpty() }
@@ -1082,13 +1090,10 @@ class MainActivity : Activity() {
         }
         committedText.append(t)
         if (assistMode) {
-            if (looksLikeQuestion(t)) {
-                log("识别到提问: $t → 800ms 后生成话术")
+            if (t.length >= 3) {
+                log("实战模式识别到面试官说话: $t → 600ms 后生成话术")
                 handler.post { questionView.text = t }
-                scheduleStrategy(t, 800)
-            } else {
-                // 候选人回答期间若有停顿，也允许基于上下文补一版话术（同一问题 30s 内去重）
-                handler.removeCallbacks(strategyDebounce)
+                scheduleStrategy(t, 600)
             }
         }
     }
@@ -1197,6 +1202,13 @@ class MainActivity : Activity() {
                 log("TTS 播题开始 @${ttsStartMs}ms（计入面试官提问过滤时间窗）")
             }
             override fun onDone(utteranceId: String?) {
+                if (utteranceId?.startsWith("next_") == true) {
+                    if (!assistMode && !transcribing) {
+                        log("下一题播报完成，自动开始新一轮回答")
+                        handler.postDelayed({ startRoundAfterQuestion() }, 350)
+                    }
+                    return
+                }
                 if (utteranceId?.startsWith("strategy_") == true) {
                     val cost = SystemClock.elapsedRealtime() - speakStartAt
                     log("话术播报完成，用时 ${cost}ms")
@@ -1451,7 +1463,14 @@ class MainActivity : Activity() {
         Thread.sleep(300) // 等 end 帧送达
         okWs?.close(1000, "done")
         okWs = null
-        setButtonRunning(false)
+        if (assistMode) {
+            setButtonRunning(false)
+        } else {
+            handler.post {
+                btnStart.text = "准备下一题…"
+                btnStart.isEnabled = false
+            }
+        }
         stopService(Intent(this, DiagService::class.java))
         status("转写结束")
         if (curSentence.isNotEmpty()) { commitSentence(curSentence, curBg, curEd); curSentence = "" }
@@ -1460,12 +1479,12 @@ class MainActivity : Activity() {
         log("转写文本: ${committedText.length}字（过滤提问句 $droppedSentences 句）")
         // 基于转写结果生成面试反馈（独立线程；等 result 下行收敛后触发）
         handler.postDelayed({ generateFeedback() }, 800)
-        // F5：六维复盘（并行，落库后可从复盘卡进入）
-        handler.postDelayed({ generateReport() }, 1400)
+        // F5：六维复盘（排在下一题之后，避免并发拖慢追问）
+        handler.postDelayed({ generateReport() }, 7000)
         // 练习模式：答完后生成「参考话术」供对照（不自动播报）
-        if (!assistMode) handler.postDelayed({ generateReferenceStrategy() }, 2200)
+        if (!assistMode) handler.postDelayed({ generateReferenceStrategy() }, 5000)
         // 练习模式：根据真实回答 + 资料，生成下一题（深挖或换题）并播报（静音后 0.9s 即发问）
-        if (!assistMode) handler.postDelayed({ generateNextQuestion() }, 900)
+        if (!assistMode) handler.post { generateNextQuestion() }
     }
 
     // ---------- DeepSeek 面试反馈 ----------
@@ -1870,14 +1889,14 @@ class MainActivity : Activity() {
         override fun run() {
             if (!transcribing || assistMode) return
             val now = SystemClock.elapsedRealtime()
-            if (questionSpokenAt > 0 && now - questionSpokenAt > 2500) {
-                if (hasSpeech && now - lastVoiceAt >= 1500) {
-                    log("静音 1.5s（最后人声 ${now - lastVoiceAt}ms 前），自动结束本轮回答")
+            if (questionSpokenAt > 0 && now - questionSpokenAt > 1500) {
+                if (hasSpeech && now - lastVoiceAt >= 1000) {
+                    log("静音 1.0s（最后人声 ${now - lastVoiceAt}ms 前），自动结束本轮回答")
                     stopTranscribe("静音自动结束")
                     return
                 }
             }
-            handler.postDelayed(this, 300)
+            handler.postDelayed(this, 200)
         }
     }
 
@@ -1944,7 +1963,9 @@ class MainActivity : Activity() {
                     nextCard.visibility = View.VISIBLE
                 }
                 status(if (assistMode) "收音中" else "答题中")
-                if (assistMode && Prefs.speakEnabled(this@MainActivity)) speakStrategy(advice.opening)
+                val willSpeak = assistMode && Prefs.speakEnabled(this@MainActivity)
+                log("话术自动播报=$willSpeak（实战=$assistMode 设置开=${Prefs.speakEnabled(this@MainActivity)} TTS就绪=$ttsReady）")
+                if (willSpeak) speakStrategy(advice.opening)
             }
         }.apply { isDaemon = true; name = "strategy-gen" }.start()
     }
@@ -1953,6 +1974,7 @@ class MainActivity : Activity() {
     private fun generateNextQuestion() {
         val q = lastQuestion
         val a = resultText()
+        val tGen = SystemClock.elapsedRealtime()
         log("生成下一题: 上一题=$q | 本轮回答 ${a.length} 字")
         Thread {
             val tips = DocumentStore.retrieve(this, a.ifBlank { q }) + BuiltinKnowledge.retrieve(this, q)
@@ -1963,7 +1985,7 @@ class MainActivity : Activity() {
                     val fallback = QUESTIONS[questionIdx % QUESTIONS.size]
                     askNextQuestion(fallback, "切换")
                 } else {
-                    log("下一题就绪: kind=${nq.kind} | ${nq.text}")
+                    log("下一题就绪(耗时${SystemClock.elapsedRealtime() - tGen}ms): kind=${nq.kind} | ${nq.text}")
                     askNextQuestion(nq.text, nq.kind)
                 }
             }
@@ -1989,6 +2011,13 @@ class MainActivity : Activity() {
         speakInterviewer(text)
     }
 
+    /** 下一题播完自动进入录音（沿用已播报题目，按钮恢复为「停止答题」） */
+    private fun startRoundAfterQuestion() {
+        if (transcribing) return
+        btnStart.isEnabled = true
+        startTranscribe()
+    }
+
     /** 面试官提问播报（与 TTS 播题共用同一个 tts 实例） */
     private fun speakInterviewer(text: String) {
         if (!ttsReady) {
@@ -1996,6 +2025,10 @@ class MainActivity : Activity() {
             return
         }
         val r = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "next_$roundNo")
+        handler.post {
+            btnStart.text = "听题中…"
+            btnStart.isEnabled = false
+        }
         log("播报下一题(返回=$r): $text")
     }
 
