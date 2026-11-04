@@ -118,6 +118,8 @@ class MainActivity : Activity() {
     private lateinit var strategyView: TextView
     private lateinit var nextView: TextView
     private lateinit var modeChip: TextView
+    private lateinit var btnModePractice: TextView
+    private lateinit var btnModeAssist: TextView
     private lateinit var speakStateView: TextView
     private lateinit var chipsRow: LinearLayout
     private lateinit var transcriptCard: LinearLayout
@@ -132,6 +134,9 @@ class MainActivity : Activity() {
     private var roundNo = 0
     private var askedCount = 0
     private var pendingNextQuestion: String? = null
+    private var lastVoiceAt = 0L
+    private var hasSpeech = false
+    private var questionSpokenAt = 0L
     private var dlgRef: AlertDialog? = null
 
     // TTS 播题
@@ -183,7 +188,7 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v2.2.0（练习连续面试: 问→答→追问）")
+        log("应用启动 v2.3.0（练习/实战切换 · 静音自动接话）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
@@ -306,15 +311,29 @@ class MainActivity : Activity() {
             setTextColor(C.TEXT)
             typeface = Typeface.DEFAULT_BOLD
         }
-        modeChip = TextView(this).apply {
-            text = if (assistMode) "实战模式" else "练习模式"
+        // 模式切换：练习 / 实战 两个并排按钮（当前模式高亮）
+        fun modeBtn(label: String, on: Boolean, click: () -> Unit): TextView = TextView(this).apply {
+            text = label
             textSize = 12f
-            setTextColor(C.ACCENT_SOFT)
             gravity = Gravity.CENTER
             setPadding(dp(13), dp(7), dp(13), dp(7))
-            background = rounded(0xFFE4EAE5.toInt(), null, 999)
-            setOnClickListener { toggleMode() }
+            setTextColor(if (on) 0xFFFFFFFF.toInt() else C.ACCENT_SOFT)
+            background = if (on) rounded(C.ACCENT, null, 999)
+            else rounded(0xFFE4EAE5.toInt(), null, 999)
+            setOnClickListener { click() }
         }
+        btnModePractice = modeBtn("练习", !assistMode) { switchMode(false) }
+        btnModeAssist = modeBtn("实战", assistMode) { switchMode(true) }
+        val modeSwitch = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btnModePractice, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(btnModeAssist, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                leftMargin = dp(6)
+            })
+        }
+        modeChip = btnModePractice
         val reportBtn = TextView(this).apply {
             text = "复盘"
             textSize = 12f
@@ -330,7 +349,7 @@ class MainActivity : Activity() {
             setOnClickListener { openSettings() }
         }
         header.addView(brand, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        header.addView(modeChip)
+        header.addView(modeSwitch)
         header.addView(reportBtn)
         header.addView(gear)
 
@@ -364,7 +383,7 @@ class MainActivity : Activity() {
 
         // 3) 开场话术（可直接说出口）
         strategyView = TextView(this).apply {
-            text = "提问后 3 秒内给出可直接说出口的开场话术。"
+            text = "回答后给出参考话术与下一题。"
             textSize = 18f
             setTextColor(C.TEXT)
             setLineSpacing(dp(6).toFloat(), 1.45f)
@@ -526,7 +545,14 @@ class MainActivity : Activity() {
     }
 
     private fun refreshModeUi() {
-        modeChip.text = if (assistMode) "实战模式" else "练习模式"
+        val active = 0xFFFFFFFF.toInt()
+        val idle = C.ACCENT_SOFT
+        btnModePractice.text = "练习"
+        btnModePractice.setTextColor(if (assistMode) idle else active)
+        btnModePractice.background = if (assistMode) rounded(0xFFE4EAE5.toInt(), null, 999) else rounded(C.ACCENT, null, 999)
+        btnModeAssist.text = "实战"
+        btnModeAssist.setTextColor(if (assistMode) active else idle)
+        btnModeAssist.background = if (assistMode) rounded(C.ACCENT, null, 999) else rounded(0xFFE4EAE5.toInt(), null, 999)
         resultView.textSize = if (assistMode) 12f else 14f
         resultView.setTextColor(if (assistMode) C.DIM else C.BODY)
         questionView.text = if (assistMode) "等待面试官提问…" else "点击开始答题，面试官将提问"
@@ -541,8 +567,9 @@ class MainActivity : Activity() {
         refreshUploadCard()
     }
 
-    private fun toggleMode() {
-        assistMode = !assistMode
+    private fun switchMode(assist: Boolean) {
+        if (assistMode == assist) return
+        assistMode = assist
         Prefs.setMode(this, if (assistMode) Prefs.MODE_ASSIST else Prefs.MODE_PRACTICE)
         refreshModeUi()
         log("切换模式: ${if (assistMode) "实战模式" else "练习模式"}")
@@ -1179,6 +1206,7 @@ class MainActivity : Activity() {
                 ttsEndMs = SystemClock.elapsedRealtime() - recordStartElapsed
                 log("TTS 播题完成 @${ttsEndMs}ms")
                 // 练习模式：只提问，不自动生成/播报话术（答完再看参考）
+                questionSpokenAt = SystemClock.elapsedRealtime()
                 log("TTS 播题结束（练习模式：等用户回答）")
             }
             override fun onError(utteranceId: String?) { log("TTS 错误: $utteranceId") }
@@ -1261,7 +1289,10 @@ class MainActivity : Activity() {
                     stream?.write(buf, 0, n)
                     onFrame?.invoke(buf, n)
                     val rmsNow = lastRms
-                    handler.post { waveView.push(rmsNow) }
+                    handler.post {
+                        waveView.push(rmsNow)
+                        if (!assistMode && transcribing && rmsNow > 600) markVoice()
+                    }
                 } else if (n < 0) {
                     log("录音 read 返回错误码 $n")
                 }
@@ -1398,12 +1429,20 @@ class MainActivity : Activity() {
             return
         }
         status("录音转写中…（最长 60s）")
+        if (!assistMode) {
+            hasSpeech = false
+            lastVoiceAt = 0L
+            if (pendingNextQuestion != null) questionSpokenAt = SystemClock.elapsedRealtime()
+            handler.removeCallbacks(silenceWatcher)
+            handler.postDelayed(silenceWatcher, 500)
+        }
         handler.postDelayed({ if (transcribing) stopTranscribe("60s 上限自动结束") }, MAX_DURATION_MS)
     }
 
     private fun stopTranscribe(reason: String) {
         if (!transcribing) return
         transcribing = false
+        handler.removeCallbacks(silenceWatcher)
         log("结束转写: $reason")
         log("推流统计: sendFrames=$sendFrames sendBytes=$sendBytes（采集 ${recordBytes}B）最近帧 RMS=${"%.1f".format(lastRms)}")
         stopRecording(reason)
@@ -1424,9 +1463,9 @@ class MainActivity : Activity() {
         // F5：六维复盘（并行，落库后可从复盘卡进入）
         handler.postDelayed({ generateReport() }, 1400)
         // 练习模式：答完后生成「参考话术」供对照（不自动播报）
-        if (!assistMode) handler.postDelayed({ generateReferenceStrategy() }, 900)
-        // 练习模式：根据真实回答 + 资料，生成下一题（深挖或换题）并播报
-        if (!assistMode) handler.postDelayed({ generateNextQuestion() }, 2600)
+        if (!assistMode) handler.postDelayed({ generateReferenceStrategy() }, 2200)
+        // 练习模式：根据真实回答 + 资料，生成下一题（深挖或换题）并播报（静音后 0.9s 即发问）
+        if (!assistMode) handler.postDelayed({ generateNextQuestion() }, 900)
     }
 
     // ---------- DeepSeek 面试反馈 ----------
@@ -1597,6 +1636,7 @@ class MainActivity : Activity() {
                         if (newSentence) curBg = bg
                         curEd = ed
                         curSentence = text
+                        if (!assistMode) markVoice()
                         if (isFinal) {
                             commitSentence(curSentence, curBg, curEd)
                             curSentence = ""
@@ -1823,6 +1863,27 @@ class MainActivity : Activity() {
         log("DEBUG 注入提问: $q")
         questionView.text = q
         scheduleStrategy(q, 200)
+    }
+
+    /** 练习模式静音自动接话：检测到说过话后，静音 1.5s 自动结束本轮并发问 */
+    private val silenceWatcher = object : Runnable {
+        override fun run() {
+            if (!transcribing || assistMode) return
+            val now = SystemClock.elapsedRealtime()
+            if (questionSpokenAt > 0 && now - questionSpokenAt > 2500) {
+                if (hasSpeech && now - lastVoiceAt >= 1500) {
+                    log("静音 1.5s（最后人声 ${now - lastVoiceAt}ms 前），自动结束本轮回答")
+                    stopTranscribe("静音自动结束")
+                    return
+                }
+            }
+            handler.postDelayed(this, 300)
+        }
+    }
+
+    private fun markVoice() {
+        lastVoiceAt = SystemClock.elapsedRealtime()
+        hasSpeech = true
     }
 
     private fun looksLikeQuestion(s: String): Boolean {
