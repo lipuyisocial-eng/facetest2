@@ -39,6 +39,7 @@ import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -65,9 +66,11 @@ class MainActivity : Activity() {
         private const val REQ_RECORD_AUDIO = 100
         private const val MAX_DURATION_MS = 60_000L // 单次答题上限：60s 自动结束（防异常悬挂）
 
-        // 讯飞实时转写（RTASR）密钥 —— 用户确认内置 APK
+        // 讯飞实时转写大模型（rtasr_llm，用户 2026-11-04 开通）—— APP_ID/API_KEY 内置 APK；
+        // API_SECRET 走 local.properties → BuildConfig（不入库，防密钥泄露；正式发布建议改服务端代理）
         private const val XF_APP_ID = "6eb32081"
         private const val XF_API_KEY = "9f15c5590c9bcb7ed781a8a6a4f61281"
+        private const val XF_API_SECRET = BuildConfig.XF_API_SECRET
 
         // DeepSeek 回答反馈密钥 —— 用户提供（2026-11-04）；经 local.properties 注入 BuildConfig（不入库，防密钥泄露）；
         // 正式对外发布必须改服务端代理，禁止前端直连暴露
@@ -445,14 +448,38 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- 讯飞实时转写 ----------
-    private fun xfSigna(ts: String): String {
-        val md5 = MessageDigest.getInstance("MD5").digest((XF_APP_ID + ts).toByteArray(Charsets.UTF_8))
-        val md5Hex = md5.joinToString("") { "%02x".format(it) }
+    // ---------- 讯飞实时转写大模型（rtasr_llm）----------
+    private var currentSessionId = ""
+
+    /**
+     * rtasr_llm 新协议（office-api-ast-dx）：
+     * - 端点 wss://office-api-ast-dx.iflyaisol.com/ast/communicate/v1
+     * - 签名：全部请求参数（不含 signature）按参数名升序排序，键值分别 URL 编码后以 & 拼接；
+     *   HmacSHA1(baseString, accessKeySecret) → Base64 → URL 编码得到 signature
+     * - role_type=2 实时角色分离（盲分）：result 的 cw[0].rl 为说话人切换标记（0 继续上一说话人）
+     */
+    private fun buildXfUrl(): String {
+        currentSessionId = UUID.randomUUID().toString()
+        val utc = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US).format(Date())
+        val params = sortedMapOf(
+            "accessKeyId" to XF_API_KEY,
+            "appId" to XF_APP_ID,
+            "audio_encode" to "pcm_s16le",
+            "lang" to "autodialect",
+            "role_type" to "2",
+            "samplerate" to "16000",
+            "utc" to utc,
+            "uuid" to currentSessionId
+        )
+        val baseString = params.entries.joinToString("&") { (k, v) ->
+            URLEncoder.encode(k, "UTF-8") + "=" + URLEncoder.encode(v, "UTF-8")
+        }
         val mac = Mac.getInstance("HmacSHA1")
-        mac.init(SecretKeySpec(XF_API_KEY.toByteArray(Charsets.UTF_8), "HmacSHA1"))
-        val sig = mac.doFinal(md5Hex.toByteArray(Charsets.UTF_8))
-        return android.util.Base64.encodeToString(sig, android.util.Base64.NO_WRAP)
+        mac.init(SecretKeySpec(XF_API_SECRET.toByteArray(Charsets.UTF_8), "HmacSHA1"))
+        val sig = android.util.Base64.encodeToString(
+            mac.doFinal(baseString.toByteArray(Charsets.UTF_8)), android.util.Base64.NO_WRAP)
+        return "wss://office-api-ast-dx.iflyaisol.com/ast/communicate/v1?" +
+            baseString + "&signature=" + URLEncoder.encode(sig, "UTF-8")
     }
 
     private fun startTranscribe() {
@@ -470,13 +497,11 @@ class MainActivity : Activity() {
         initTtsIfNeeded()
         handler.postDelayed({ speakQuestion() }, 600)
 
-        val ts = (System.currentTimeMillis() / 1000).toString()
-        val signa = URLEncoder.encode(xfSigna(ts), "UTF-8") // signa 含 +/=/ 必须 URL 编码，否则 10110 illegal signa
-        val path = "/v1/ws?appid=$XF_APP_ID&ts=$ts&signa=$signa&vadMdn=2&role_type=2"
-        log("连接讯飞 RTASR…")
+        val url = buildXfUrl()
+        log("连接讯飞 RTASR-LLM…（role_type=2 角色分离）")
 
         val client = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).build()
-        val req = Request.Builder().url("wss://rtasr.xfyun.cn$path").build()
+        val req = Request.Builder().url(url).build()
         client.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 log("WS 打开，启动推流线程")
@@ -523,7 +548,7 @@ class MainActivity : Activity() {
         log("推流统计: sendFrames=$sendFrames sendBytes=$sendBytes（采集 ${recordBytes}B）最近帧 RMS=${"%.1f".format(lastRms)}")
         stopRecording(reason)
         try { tts?.stop() } catch (_: Exception) {}
-        okWs?.send("{\"end\":true}".encodeUtf8())
+        okWs?.send("{\"end\":true,\"sessionId\":\"$currentSessionId\"}".encodeUtf8())
         Thread.sleep(300) // 等 end 帧送达
         okWs?.close(1000, "done")
         okWs = null
@@ -627,7 +652,7 @@ class MainActivity : Activity() {
                     val st = cn.optJSONObject("st") ?: return
                     val rt = st.optJSONArray("rt") ?: return
                     val sb = StringBuilder()
-                    var role = ""
+                    var rlSeen = ""
                     for (i in 0 until rt.length()) {
                         val seg = rt.getJSONObject(i)
                         val wsArr = seg.optJSONArray("ws") ?: continue
@@ -636,19 +661,17 @@ class MainActivity : Activity() {
                             val cw = w.optJSONArray("cw") ?: continue
                             if (cw.length() > 0) {
                                 val c = cw.getJSONObject(0)
-                                if (role.isEmpty()) role = c.optString("rl", "")
+                                val r = c.optString("rl", "")
+                                if (r.isNotEmpty() && r != "0") rlSeen += "$r,"
                                 sb.append(c.optString("w", ""))
                             }
                         }
                     }
-                    // role_type=2 角色分离：rl=1 面试官 / rl=2 候选人；仅候选人文案进转写区与反馈
+                    // role_type=2 盲分：rl 为说话人切换标记（0 继续上一说话人），先全量收集+打标日志，
+                    // 待实测确定说话人编号与角色对应后再做过滤
                     if (sb.isNotEmpty()) {
-                        if (role == "1") {
-                            log("讯飞识别(面试官,跳过): $sb")
-                        } else {
-                            log("讯飞识别(候选人, rl=$role): $sb")
-                            appendResult(sb.toString())
-                        }
+                        log("讯飞识别: $sb (rl切换: ${rlSeen.trimEnd(',')})")
+                        appendResult(sb.toString())
                     }
                 }
                 "error" -> {

@@ -11,6 +11,8 @@ val localProps = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 val deepseekKey = localProps.getProperty("deepseek_key") ?: "sk-LOCAL_KEY_PLACEHOLDER"
+// 讯飞实时语音转写大模型(rtasr_llm) API Secret：新协议签名密钥（控制台-服务接口认证信息-APISecret）
+val xfApiSecret = localProps.getProperty("xf_api_secret") ?: "XF_SECRET_PLACEHOLDER"
 
 android {
     namespace = "com.xingyihui.interviewassistant.diag"
@@ -24,6 +26,9 @@ android {
         versionName = "1.2.0"
 
         buildConfigField("String", "DEEPSEEK_API_KEY", "\"$deepseekKey\"")
+        buildConfigField("String", "XF_API_SECRET", "\"$xfApiSecret\"")
+        buildConfigField("String", "XF_APP_ID", "\"6eb32081\"")
+        buildConfigField("String", "XF_API_KEY", "\"9f15c5590c9bcb7ed781a8a6a4f61281\"")
     }
 
     buildTypes {
