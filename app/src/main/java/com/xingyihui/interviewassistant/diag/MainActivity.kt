@@ -152,6 +152,9 @@ class MainActivity : Activity() {
     private var adviceStartAt = 0L
     private var adviceSafety: Runnable? = null
     private var lastSpokenText = ""
+    private var speechHoldUntil = 0L
+    private val recentInterviewer = ArrayList<Pair<String, Long>>()
+    private val recentSpoken = ArrayList<Pair<String, Long>>()
     private var dlgRef: AlertDialog? = null
 
     // TTS 播题
@@ -203,13 +206,28 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v2.8.0（回声/新提问区分）")
+        log("应用启动 v3.0.0（低延迟 · 不被回声打断 · 停止即静音）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
         checkRecordPermission()
         // 调试钩子：adb am start -e debug_question "问题" 可直接驱动「真人辅助」提问识别链路（仅 debug 包）
         if (BuildConfig.DEBUG) {
+            try {
+                val filter = android.content.IntentFilter("com.xingyihui.DEBUG_TRANSCRIPT")
+                registerReceiver(object : android.content.BroadcastReceiver() {
+                    override fun onReceive(c: android.content.Context?, i: Intent?) {
+                        val t = i?.getStringExtra("text").orEmpty()
+                        if (t.isNotBlank()) {
+                            log("DEBUG 广播注入转写: $t")
+                            commitSentence(t, 0L, 0L)
+                        }
+                    }
+                }, filter, android.content.Context.RECEIVER_EXPORTED)
+                log("调试广播已注册: com.xingyihui.DEBUG_TRANSCRIPT")
+            } catch (e: Exception) {
+                log("调试广播注册失败: ${e.message}")
+            }
             intent?.getStringExtra("debug_kb_file")?.let { name ->
                 Thread {
                     try {
@@ -1163,13 +1181,37 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         lastRecognized = t
         if (assistMode) {
             val now = SystemClock.elapsedRealtime()
+            val nowMs = SystemClock.elapsedRealtime()
+            val echoOfSpoken = recentSpoken.any { (txt, at) ->
+                nowMs - at < 15_000 && textSim(txt, t) >= 0.45
+            }
+            if (echoOfSpoken) {
+                ignoreCount++
+                lastIgnoreReason = "自身播报回声"
+                log("忽略自身播报回声: $t")
+                return
+            }
+            val continuation = recentInterviewer.any { (txt, at) ->
+                nowMs - at < 25_000 && textSim(txt, t) >= 0.55
+            }
             if (adviceSpeaking) {
-                // 和正在播报的话术高度重合 → 是外放回声，忽略；否则是面试官新提问 → 打断播报去回答
                 val sim = if (lastSpokenText.isBlank()) 0.0 else charOverlap(lastSpokenText, t)
+                if (continuation) {
+                    ignoreCount++
+                    lastIgnoreReason = "同一提问的分句"
+                    log("忽略：同一提问的后续分句: $t")
+                    return
+                }
                 if (sim >= 0.45) {
                     ignoreCount++
                     lastIgnoreReason = "回声(sim=${"%.2f".format(sim)})"
                     log("忽略回声（相似度 ${"%.2f".format(sim)}）: $t")
+                    return
+                }
+                if (nowMs < speechHoldUntil) {
+                    ignoreCount++
+                    lastIgnoreReason = "播报前段保护"
+                    log("播报前段保护期内，忽略可能的误触发: $t")
                     return
                 }
                 log("检测到面试官新提问（与播报相似度 ${"%.2f".format(sim)}），打断播报: $t")
@@ -1177,6 +1219,12 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                 adviceSpeaking = false
                 adviceSafety?.let { handler.removeCallbacks(it) }
             }
+            if (continuation) {
+                log("忽略：同一提问的后续分句（未在播报）: $t")
+                return
+            }
+            recentInterviewer.add(t to nowMs)
+            while (recentInterviewer.size > 5) recentInterviewer.removeAt(0)
             if (now < adviceCooldownUntil) {
                 ignoreCount++
                 lastIgnoreReason = "冷却中"
@@ -1184,9 +1232,9 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                 return
             }
             if (t.length >= 3) {
-                log("实战模式识别到面试官说话: $t → 600ms 后生成话术")
+                log("实战模式识别到面试官说话: $t → 250ms 后生成话术")
                 handler.post { questionView.text = t }
-                scheduleStrategy(t, 600)
+                scheduleStrategy(t, 250)
             }
         }
     }
@@ -1557,6 +1605,8 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         handler.removeCallbacks(speakTicker)
         adviceSpeaking = false
         adviceSafety?.let { handler.removeCallbacks(it) }
+        strategyJob++
+        handler.removeCallbacks(strategyDebounce)
         handler.post { speakStateView.text = "" }
             handler.postDelayed(silenceWatcher, 500)
         }
@@ -1571,6 +1621,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         log("推流统计: sendFrames=$sendFrames sendBytes=$sendBytes（采集 ${recordBytes}B）最近帧 RMS=${"%.1f".format(lastRms)}")
         stopRecording(reason)
         try { tts?.stop() } catch (_: Exception) {}
+        handler.postDelayed({ log("停止后 TTS.isSpeaking=${tts?.isSpeaking}") }, 300)
         okWs?.send("{\"end\":true,\"sessionId\":\"$currentSessionId\"}".encodeUtf8())
         Thread.sleep(300) // 等 end 帧送达
         okWs?.close(1000, "done")
@@ -2017,6 +2068,20 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         }
     }
 
+    /** 包含度相似度：hits / min(len)，用于判断「这段识别是不是我播报内容的一部分」 */
+    private fun textSim(a: String, b: String): Double {
+        val x = a.filter { it.isLetterOrDigit() }
+        val y = b.filter { it.isLetterOrDigit() }
+        if (x.isEmpty() || y.isEmpty()) return 0.0
+        val pool = y.toMutableList()
+        var hit = 0
+        for (c in x) {
+            val i = pool.indexOf(c)
+            if (i >= 0) { hit++; pool.removeAt(i) }
+        }
+        return hit.toDouble() / minOf(x.length, y.length)
+    }
+
     private fun markVoice() {
         lastVoiceAt = SystemClock.elapsedRealtime()
         hasSpeech = true
@@ -2074,6 +2139,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                 }
                 val total = SystemClock.elapsedRealtime() - t0
                 log("话术就绪: 模型${advice.elapsedMs}ms / 总${total}ms | SAY=${advice.opening} | NEXT=${advice.followup}")
+                log("端到端：去抖250ms + 生成${total}ms → 开始播报")
                 Conversation.addAdvice(q, advice.opening)
                 currentStrategy = advice.opening
                 strategyView.text = "「${advice.opening}」"
@@ -2224,6 +2290,10 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
     }
 
     private fun speakStrategy(text: String) {
+        if (!transcribing) {
+            log("会话已停止，丢弃迟到的话术播报")
+            return
+        }
         if (!ttsReady) {
             log("TTS 未就绪，话术仅上屏")
             return
@@ -2231,6 +2301,9 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         val say = StrategyEngine.speechText(text)
         adviceSpeaking = true
         lastSpokenText = say
+        recentSpoken.add(say to SystemClock.elapsedRealtime())
+        while (recentSpoken.size > 4) recentSpoken.removeAt(0)
+        speechHoldUntil = SystemClock.elapsedRealtime() + 2500
         adviceStartAt = SystemClock.elapsedRealtime()
         speakStartAt = adviceStartAt
         adviceSafety?.let { handler.removeCallbacks(it) }
