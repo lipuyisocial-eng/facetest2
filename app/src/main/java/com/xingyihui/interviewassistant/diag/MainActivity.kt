@@ -78,6 +78,7 @@ class MainActivity : Activity() {
         private const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
         private const val REQ_RECORD_AUDIO = 100
         private const val REQ_DOC = 200
+        private const val REQ_NOTIFY = 300
         private const val MAX_DURATION_MS = 30 * 60_000L // 单次收音上限 30 分钟（原 60s 过短，真实面试会被自动掐断）
 
         // 讯飞实时转写大模型（rtasr_llm，用户 2026-11-04 开通）—— APP_ID/API_KEY 内置 APK（控制台 rtasr_llm 产品页 WebAPI 认证）；
@@ -210,11 +211,10 @@ class MainActivity : Activity() {
         window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or
             View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
         // 转写期间保持应用前台：避免 ColorOS 后台网络限制（实测：后台态推流零 result）
-        setShowWhenLocked(true)
-        setTurnScreenOn(true)
+        // 不主动点亮屏幕/不覆盖锁屏，避免放裤兜时误触
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v3.2.0（声学说话人归属 · 耳机键兜底）")
+        log("应用启动 v3.3.0（锁屏/后台继续收音）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         try {
@@ -681,8 +681,31 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
 播报中标记：$adviceSpeaking　忽略次数：$ignoreCount
 最近忽略原因：${lastIgnoreReason.ifBlank { "无" }}
 上次结束原因：${lastStopReason.ifBlank { "无" }}
+后台存活：前台服务 + 唤醒锁（锁屏继续收音）
 最近播报：${speakStateView.text}
 """.trim()
+    }
+
+    /** 申请忽略电池优化（Android 6+），提高锁屏后台存活率 */
+    private fun requestIgnoreBattery() {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= 23) {
+                val pm = getSystemService(POWER_SERVICE) as android.os.PowerManager
+                if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                    startActivity(Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        android.net.Uri.parse("package:$packageName")))
+                    log("已请求忽略电池优化")
+                } else {
+                    status("已允许忽略电池优化")
+                    log("电池优化已忽略")
+                }
+            }
+        } catch (e: Exception) {
+            log("请求忽略电池优化失败: ${e.message}")
+            try {
+                startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: Exception) {}
+        }
     }
 
     private fun refreshUploadCard() {
@@ -993,6 +1016,18 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         box.addView(entry("资料库 / 知识库（${DocumentStore.list(this).size} 份）") {
             dlgRef?.dismiss()
             openDocs()
+        })
+        box.addView(entry("锁屏/后台运行设置") {
+            AlertDialog.Builder(this)
+                .setTitle("锁屏、后台继续收音")
+                .setMessage("本应用用「前台服务 + 麦克风类型 + 唤醒锁」在锁屏/后台继续收音与播报。\n\n" +
+                    "建议同时做两步，避免 ColorOS 冻结：\n" +
+                    "1）点下面的「去允许后台」按钮，允许忽略电池优化\n" +
+                    "2）系统设置 → 电池 → 应用耗电管理 → 面试博弈助手 → 允许后台活动/自启动\n\n" +
+                    "真实面试时手机可锁屏放兜里，耳机接住播报即可。")
+                .setPositiveButton("去允许后台") { _, _ -> requestIgnoreBattery() }
+                .setNegativeButton("关闭", null)
+                .show()
         })
         box.addView(entry("诊断信息（排查没反应/没声音）") {
             AlertDialog.Builder(this)
@@ -1353,6 +1388,10 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
 
     // ---------- 权限 ----------
     private fun checkRecordPermission() {
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), REQ_NOTIFY)
+        }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             log("RECORD_AUDIO 已授权")
         } else {
@@ -2446,10 +2485,10 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
     // ---------- 生命周期 ----------
     override fun onPause() {
         super.onPause()
-        // 正式版转写依赖可见前台（ColorOS 后台会冻结网络），退后台即停止
+        // 真实面试场景：手机放兜里/锁屏。保持前台服务 + 唤醒锁运行，不再退后台即停
         if (recording || transcribing) {
-            log("onPause：自动停止转写")
-            stopTranscribe("退后台自动结束")
+            log("onPause：进入后台，继续收音（前台服务保活）")
+            status("后台收音中（锁屏继续）")
         }
     }
 

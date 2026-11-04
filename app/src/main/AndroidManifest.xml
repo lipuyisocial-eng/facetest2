@@ -3,6 +3,8 @@
 
     <!-- 实时转写：麦克风录音 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- 讯飞 RTASR（WebSocket 网络访问） -->
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- 前台服务（转写期间保活，防 ColorOS 后台冻结）：通知 + 麦克风类型（targetSdk 34 需 FOREGROUND_SERVICE_MICROPHONE） -->
