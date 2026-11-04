@@ -472,7 +472,7 @@ class MainActivity : Activity() {
 
         val ts = (System.currentTimeMillis() / 1000).toString()
         val signa = URLEncoder.encode(xfSigna(ts), "UTF-8") // signa 含 +/=/ 必须 URL 编码，否则 10110 illegal signa
-        val path = "/v1/ws?appid=$XF_APP_ID&ts=$ts&signa=$signa&vadMdn=2"
+        val path = "/v1/ws?appid=$XF_APP_ID&ts=$ts&signa=$signa&vadMdn=2&role_type=2"
         log("连接讯飞 RTASR…")
 
         val client = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).build()
@@ -627,18 +627,28 @@ class MainActivity : Activity() {
                     val st = cn.optJSONObject("st") ?: return
                     val rt = st.optJSONArray("rt") ?: return
                     val sb = StringBuilder()
+                    var role = ""
                     for (i in 0 until rt.length()) {
                         val seg = rt.getJSONObject(i)
                         val wsArr = seg.optJSONArray("ws") ?: continue
                         for (j in 0 until wsArr.length()) {
                             val w = wsArr.getJSONObject(j)
                             val cw = w.optJSONArray("cw") ?: continue
-                            if (cw.length() > 0) sb.append(cw.getJSONObject(0).optString("w", ""))
+                            if (cw.length() > 0) {
+                                val c = cw.getJSONObject(0)
+                                if (role.isEmpty()) role = c.optString("rl", "")
+                                sb.append(c.optString("w", ""))
+                            }
                         }
                     }
+                    // role_type=2 角色分离：rl=1 面试官 / rl=2 候选人；仅候选人文案进转写区与反馈
                     if (sb.isNotEmpty()) {
-                        log("讯飞识别: $sb")
-                        appendResult(sb.toString())
+                        if (role == "1") {
+                            log("讯飞识别(面试官,跳过): $sb")
+                        } else {
+                            log("讯飞识别(候选人, rl=$role): $sb")
+                            appendResult(sb.toString())
+                        }
                     }
                 }
                 "error" -> {
