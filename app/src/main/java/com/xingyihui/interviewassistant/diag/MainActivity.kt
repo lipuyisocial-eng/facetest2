@@ -46,10 +46,11 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.math.sqrt
 
 /**
- * 面试博弈助手 · 正式版 v1.0.0
+ * 面试博弈助手 · 正式版 v1.4.1
  *
- * 核心链路：点击开始 → 录音（16kHz 单声道 16bit）→ 讯飞 RTASR 实时转写（OkHttp WebSocket，
- * 独立推流线程 40ms 固定节奏）→ 识别文字实时上屏 → 点击停止结束并发送 end 帧。
+ * 核心链路：点击开始 → TTS 播题 + 录音（16kHz 单声道 16bit）→ 讯飞 rtasr_llm 实时转写
+ * （OkHttp WebSocket，独立推流线程 40ms 固定节奏）→ 按句子重组后实时上屏 → 停止后发 end 帧
+ * → DeepSeek 流式生成面试反馈（命中知识库语料则注入参考要点）。
  *
  * 保活：前台服务 + 通知（ColorOS 锁屏/后台会冻结应用，实测推流线程无 CPU 时间片 → 讯飞静默拒识）；
  * 屏幕常亮 + setShowWhenLocked（转写期间保持可见前台）。
@@ -133,8 +134,17 @@ class MainActivity : Activity() {
     private var questionIdx = 0
     private var lastQuestion = ""
 
-    // 转写结果收集（供 DeepSeek 反馈）
-    private val resultBuffer = StringBuilder()
+    // 转写结果：rtasr_llm 每帧给的是「当前句子的累计文本」（bg=句子起点，type=0 定稿），
+    // 因此按句子重组：已定稿句 committedText + 正在说的当前句 curSentence
+    private val committedText = StringBuilder()
+    private var curSentence = ""
+    private var curBg = -1L
+    private var curEd = 0L
+    private var ttsStartMs = -1L
+    private var ttsEndMs = -1L
+    private var droppedSentences = 0
+
+    private fun resultText(): String = (committedText.toString() + curSentence).trim()
 
     // 录音
     private var audioRecord: AudioRecord? = null
@@ -150,6 +160,7 @@ class MainActivity : Activity() {
     private var okWs: WebSocket? = null
     @Volatile private var transcribing = false
     private var sendFrames = 0
+    private var rawFramesLogged = 0
     private var sendBytes = 0L
     private val frameQueue = LinkedBlockingQueue<ByteArray>(512)
 
@@ -160,7 +171,7 @@ class MainActivity : Activity() {
         setShowWhenLocked(true)
         setTurnScreenOn(true)
         buildUi()
-        log("应用启动 v1.4.0（正式版·实时转写·知识库）")
+        log("应用启动 v1.4.1（正式版·实时转写·知识库）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         loadCorpus()
         checkRecordPermission()
@@ -291,14 +302,56 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun appendResult(text: String) {
-        if (text != "\n") resultBuffer.append(text)
+    private val resultPlaceholder = "面试官语音提问后，你的回答将实时转为文字。"
+
+    /** 转写区渲染：整段重绘（已定稿句 + 当前句），避免逐帧追加导致的重复爆字 */
+    private fun renderResult() {
+        val text = resultText()
         handler.post {
-            val placeholder = "面试官语音提问后，你的回答将实时转为文字。"
-            resultView.text = if (resultView.text.isEmpty() || resultView.text == placeholder)
-                text else resultView.text.toString() + text
+            resultView.text = if (text.isEmpty()) resultPlaceholder else text
             (resultView.parent as? ScrollView)?.fullScroll(View.FOCUS_DOWN)
         }
+    }
+
+    /** 句子定稿：过滤面试官提问句后并入已定稿文本 */
+    private fun commitSentence(text: String, bg: Long, ed: Long) {
+        val t = text.trim()
+        if (t.isEmpty()) return
+        if (isInterviewerQuestion(t, bg, ed)) {
+            droppedSentences++
+            log("过滤面试官提问句(bg=${bg}ms ed=${ed}ms): $t")
+            return
+        }
+        committedText.append(t)
+    }
+
+    /**
+     * 面试官提问过滤（不依赖 rl 编号）：
+     * 盲分说话人编号在同一会话内不稳定（实测同一轮里 TTS 提问句被标成 rl=2、环境说话人 rl=1/3；
+     * 另一轮全是 rl=0），不能按编号定角色。改用「播报时间窗 ∩ 文本相似度」双条件，确定性可验证。
+     */
+    private fun isInterviewerQuestion(text: String, bg: Long, ed: Long): Boolean {
+        val q = lastQuestion
+        if (q.isEmpty() || ttsStartMs < 0) return false
+        val inTtsWindow = ed >= ttsStartMs - 800 && bg <= ttsEndMs + 800
+        if (!inTtsWindow) return false
+        val sim = charOverlap(q, text)
+        return sim >= 0.55
+    }
+
+    /** 字符多重集重合率：|交集| / |问题文本|，忽略标点与空白 */
+    private fun charOverlap(question: String, said: String): Double {
+        fun norm(s: String) = s.filter { it.isLetterOrDigit() }
+        val q = norm(question)
+        val s = norm(said)
+        if (q.isEmpty() || s.isEmpty()) return 0.0
+        val pool = s.toMutableList()
+        var hit = 0
+        for (c in q) {
+            val i = pool.indexOf(c)
+            if (i >= 0) { hit++; pool.removeAt(i) }
+        }
+        return hit.toDouble() / q.length
     }
 
     private fun appendFeedback(text: String) {
@@ -398,8 +451,14 @@ class MainActivity : Activity() {
             return
         }
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {}
-            override fun onDone(utteranceId: String?) { log("TTS 播题完成") }
+            override fun onStart(utteranceId: String?) {
+                ttsStartMs = SystemClock.elapsedRealtime() - recordStartElapsed
+                log("TTS 播题开始 @${ttsStartMs}ms（计入面试官提问过滤时间窗）")
+            }
+            override fun onDone(utteranceId: String?) {
+                ttsEndMs = SystemClock.elapsedRealtime() - recordStartElapsed
+                log("TTS 播题完成 @${ttsEndMs}ms")
+            }
             override fun onError(utteranceId: String?) { log("TTS 播题错误") }
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?, errorCode: Int) { log("TTS 播题错误 code=$errorCode") }
@@ -545,8 +604,16 @@ class MainActivity : Activity() {
         if (transcribing) return
         transcribing = true
         sendFrames = 0
+        rawFramesLogged = 0
         sendBytes = 0L
-        resultBuffer.setLength(0)
+        committedText.setLength(0)
+        curSentence = ""
+        curBg = -1L
+        curEd = 0L
+        droppedSentences = 0
+        ttsStartMs = -1L
+        ttsEndMs = -1L
+        handler.post { resultView.text = resultPlaceholder }
         frameQueue.clear()
         status("准备中…")
         setButtonRunning(true)
@@ -614,7 +681,9 @@ class MainActivity : Activity() {
         setButtonRunning(false)
         stopService(Intent(this, DiagService::class.java))
         status("转写结束")
-        appendResult("\n")
+        if (curSentence.isNotEmpty()) { commitSentence(curSentence, curBg, curEd); curSentence = "" }
+        renderResult()
+        log("转写文本: ${committedText.length}字（过滤提问句 $droppedSentences 句）")
         // 基于转写结果生成面试反馈（独立线程；等 result 下行收敛后触发）
         handler.postDelayed({ generateFeedback() }, 800)
     }
@@ -625,7 +694,7 @@ class MainActivity : Activity() {
      * 开发验证辅助：files/test_feedback.txt 存在且转写文本为空时，以其内容作为测试回答文本（测试后删除）。
      */
     private fun generateFeedback() {
-        val text = resultBuffer.toString().trim()
+        val text = resultText()
         var source = "实时转写"
         var answer = text
         if (answer.isEmpty()) {
@@ -723,12 +792,29 @@ class MainActivity : Activity() {
                     status("讯飞错误: $desc")
                 }
                 msgType == "result" || actionTop == "result" -> {
+                    // 原始帧采样（取前 12 帧），用于确认 sn/ls/type 等字段语义
+                    if (rawFramesLogged < 60) {
+                        rawFramesLogged++
+                        val stDbg = data?.optJSONObject("cn")?.optJSONObject("st")
+                        val wordsDbg = StringBuilder()
+                        val rtDbg = stDbg?.optJSONArray("rt")
+                        if (rtDbg != null) for (i in 0 until rtDbg.length()) {
+                            val wsDbg = rtDbg.getJSONObject(i).optJSONArray("ws") ?: continue
+                            for (j in 0 until wsDbg.length()) {
+                                val cwDbg = wsDbg.getJSONObject(j).optJSONArray("cw") ?: continue
+                                if (cwDbg.length() > 0) wordsDbg.append(cwDbg.getJSONObject(0).optString("w", ""))
+                            }
+                        }
+                        log("帧 seg=${data?.optString("seg_id")} type=${stDbg?.optString("type")} ls=${data?.optBoolean("ls")} bg=${stDbg?.optString("bg")} ed=${stDbg?.optString("ed")} | $wordsDbg")
+                    }
                     // rtasr_llm result 帧：msg_type=result，词在 data.cn.st.rt.ws.cw；经典协议为顶层 action=result
                     val cn = data?.optJSONObject("cn") ?: return
                     val st = cn.optJSONObject("st") ?: return
                     val rt = st.optJSONArray("rt") ?: return
                     val sb = StringBuilder()
                     var rlSeen = ""
+                    // 逐词 rl 标记串（形如 "<2>我上一份工作<1>好的"），仅用于测量说话人编号↔实际说话人的映射
+                    val rlWordLog = StringBuilder()
                     for (i in 0 until rt.length()) {
                         val seg = rt.getJSONObject(i)
                         val wsArr = seg.optJSONArray("ws") ?: continue
@@ -738,16 +824,44 @@ class MainActivity : Activity() {
                             if (cw.length() > 0) {
                                 val c = cw.getJSONObject(0)
                                 val r = c.optString("rl", "")
-                                if (r.isNotEmpty() && r != "0") rlSeen += "$r,"
-                                sb.append(c.optString("w", ""))
+                                val word = c.optString("w", "")
+                                if (r.isNotEmpty() && r != "0") {
+                                    rlSeen += "$r,"
+                                    if (rlWordLog.length < 300) rlWordLog.append("<$r>")
+                                }
+                                if (rlWordLog.length < 300) rlWordLog.append(word)
+                                sb.append(word)
                             }
                         }
                     }
-                    // role_type=2 盲分：rl 为说话人切换标记（0 继续上一说话人），先全量收集+打标日志，
-                    // 待实测确定说话人编号与角色对应后再做过滤
+                    // 按句子重组：bg 为句子起点，同一句内后续帧是累计文本（直接覆盖当前句），
+                    // bg 跳变 = 新句开始（上一句先定稿）；type=0 = 该句定稿。
+                    val bg = st.optString("bg", "0").toLongOrNull() ?: 0L
+                    val ed = st.optString("ed", "0").toLongOrNull() ?: 0L
+                    val isFinal = st.optString("type") == "0"
                     if (sb.isNotEmpty()) {
-                        log("讯飞识别: $sb (rl切换: ${rlSeen.trimEnd(',')})")
-                        appendResult(sb.toString())
+                        val ms = SystemClock.elapsedRealtime() - recordStartElapsed
+                        log("讯飞识别(${ms}ms): $sb (rl切换: ${rlSeen.trimEnd(',')})")
+                        log("rl逐词标记: $rlWordLog")
+                        val text = sb.toString()
+                        // 定稿帧(type=0)的 bg 会回退到句首甚至 0，不能用它判新句；
+                        // 判新句要求 bg 跳变 >800ms 且新文本不是当前句的延续。
+                        val bgJumped = curBg >= 0 && kotlin.math.abs(bg - curBg) > 800
+                        val continued = curSentence.isNotEmpty() && text.startsWith(curSentence.take(4))
+                        val newSentence = curBg < 0 || (bgJumped && !continued)
+                        if (newSentence && curSentence.isNotEmpty()) {
+                            commitSentence(curSentence, curBg, curEd)
+                            curSentence = ""
+                        }
+                        if (newSentence) curBg = bg
+                        curEd = ed
+                        curSentence = text
+                        if (isFinal) {
+                            commitSentence(curSentence, curBg, curEd)
+                            curSentence = ""
+                            curBg = -1L
+                        }
+                        renderResult()
                     }
                 }
             }
