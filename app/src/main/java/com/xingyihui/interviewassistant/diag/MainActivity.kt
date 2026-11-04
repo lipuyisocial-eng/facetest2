@@ -147,6 +147,10 @@ class MainActivity : Activity() {
     private var waitingNextQuestion = false
     private var speakingNextQuestion = false
     private var nextJob = 0
+    private var ignoreCount = 0
+    private var lastIgnoreReason = ""
+    private var adviceStartAt = 0L
+    private var adviceSafety: Runnable? = null
     private var dlgRef: AlertDialog? = null
 
     // TTS 播题
@@ -198,7 +202,7 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v2.6.0（防自激 · 可取消 · 资料必注入）")
+        log("应用启动 v2.7.0（播报自愈+诊断测试）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
@@ -587,9 +591,17 @@ class MainActivity : Activity() {
 
     private fun switchMode(assist: Boolean) {
         if (assistMode == assist) return
+        // 切换模式时清掉上一模式遗留的「准备下一题/听题中」状态，避免按钮变成取消
+        nextJob++
+        waitingNextQuestion = false
+        speakingNextQuestion = false
+        try { tts?.stop() } catch (_: Exception) {}
+        handler.removeCallbacksAndMessages(null)
         assistMode = assist
         Prefs.setMode(this, if (assistMode) Prefs.MODE_ASSIST else Prefs.MODE_PRACTICE)
         refreshModeUi()
+        setButtonRunning(false)
+        status(if (assistMode) "点到「开始答题」开始收音，面试官提问后会自动给话术" else "点「开始答题」，AI 面试官开始提问")
         log("切换模式: ${if (assistMode) "实战模式" else "练习模式"}")
     }
 
@@ -603,6 +615,8 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
 过滤阈值：${String.format(Locale.US, "%.2f", Prefs.threshold(this))}
 最近识别：${lastRecognized.ifBlank { "（还没识别到文字）" }}
 最近话术：$lastStrategyStatus
+播报中标记：$adviceSpeaking　忽略次数：$ignoreCount
+最近忽略原因：${lastIgnoreReason.ifBlank { "无" }}
 最近播报：${speakStateView.text}
 """.trim()
     }
@@ -920,7 +934,10 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
             AlertDialog.Builder(this)
                 .setTitle("诊断信息")
                 .setMessage(buildDiagnostics())
-                .setPositiveButton("知道了", null)
+                .setPositiveButton("测试播报") { _, _ ->
+                    speakInterviewer("这是一段测试播报，如果能听到，说明语音链路正常。")
+                }
+                .setNegativeButton("关闭", null)
                 .show()
         })
         box.addView(entry("隐私说明") {
@@ -1146,7 +1163,9 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         if (assistMode) {
             val now = SystemClock.elapsedRealtime()
             if (adviceSpeaking || now < adviceCooldownUntil) {
-                log("播报中/冷却期，忽略识别到的话（防自激）: $t")
+                ignoreCount++
+                lastIgnoreReason = if (adviceSpeaking) "播报中(${now - adviceStartAt}ms)" else "冷却中"
+                log("忽略识别（$lastIgnoreReason）: $t")
                 return
             }
             if (t.length >= 3) {
@@ -1274,6 +1293,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                     val cost = SystemClock.elapsedRealtime() - speakStartAt
                     log("话术播报完成，用时 ${cost}ms")
                     adviceSpeaking = false
+                    adviceSafety?.let { handler.removeCallbacks(it) }
                     adviceCooldownUntil = SystemClock.elapsedRealtime() + 1500
                     handler.post { speakStateView.text = "" }
                     return
@@ -1285,7 +1305,13 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                 ttsEchoUntil = questionSpokenAt + 1500
                 log("TTS 播题结束（练习模式：等用户回答，回声屏蔽至 +1500ms）")
             }
-            override fun onError(utteranceId: String?) { log("TTS 错误: $utteranceId") }
+            override fun onError(utteranceId: String?) {
+                log("TTS 错误: $utteranceId")
+                if (utteranceId?.startsWith("strategy_") == true) {
+                    adviceSpeaking = false
+                    adviceCooldownUntil = SystemClock.elapsedRealtime() + 500
+                }
+            }
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?, errorCode: Int) { log("TTS 错误 code=$errorCode") }
         })
@@ -1514,6 +1540,8 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
             if (pendingNextQuestion != null) questionSpokenAt = SystemClock.elapsedRealtime()
             handler.removeCallbacks(silenceWatcher)
         handler.removeCallbacks(speakTicker)
+        adviceSpeaking = false
+        adviceSafety?.let { handler.removeCallbacks(it) }
         handler.post { speakStateView.text = "" }
             handler.postDelayed(silenceWatcher, 500)
         }
@@ -2187,7 +2215,19 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         }
         val say = StrategyEngine.speechText(text)
         adviceSpeaking = true
-        speakStartAt = SystemClock.elapsedRealtime()
+        adviceStartAt = SystemClock.elapsedRealtime()
+        speakStartAt = adviceStartAt
+        adviceSafety?.let { handler.removeCallbacks(it) }
+        val safetyMs = (say.length * 350L + 6000L).coerceAtMost(30_000L)
+        val safety = Runnable {
+            if (adviceSpeaking) {
+                adviceSpeaking = false
+                adviceCooldownUntil = SystemClock.elapsedRealtime() + 1000
+                log("播报安全兜底：${safetyMs}ms 未收到完成回调，已解除播报中状态")
+            }
+        }
+        adviceSafety = safety
+        handler.postDelayed(safety, safetyMs)
         tts?.speak(say, TextToSpeech.QUEUE_FLUSH, null, "strategy_$speakStartAt")
         log("播报话术(${say.length}字): $say")
         handler.removeCallbacks(speakTicker)
