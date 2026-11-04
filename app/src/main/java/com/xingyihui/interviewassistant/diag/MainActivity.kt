@@ -129,6 +129,9 @@ class MainActivity : Activity() {
     private lateinit var waveView: WaveView
     private var assistMode = false
     private var lastReportId: String? = null
+    private var roundNo = 0
+    private var askedCount = 0
+    private var pendingNextQuestion: String? = null
     private var dlgRef: AlertDialog? = null
 
     // TTS 播题
@@ -180,7 +183,7 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v2.0.0（内置知识库 · 首页上传 · 五维复盘）")
+        log("应用启动 v2.2.0（练习连续面试: 问→答→追问）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
@@ -304,7 +307,7 @@ class MainActivity : Activity() {
             typeface = Typeface.DEFAULT_BOLD
         }
         modeChip = TextView(this).apply {
-            text = if (assistMode) "真人辅助" else "练习模式"
+            text = if (assistMode) "实战模式" else "练习模式"
             textSize = 12f
             setTextColor(C.ACCENT_SOFT)
             gravity = Gravity.CENTER
@@ -523,7 +526,7 @@ class MainActivity : Activity() {
     }
 
     private fun refreshModeUi() {
-        modeChip.text = if (assistMode) "真人辅助" else "练习模式"
+        modeChip.text = if (assistMode) "实战模式" else "练习模式"
         resultView.textSize = if (assistMode) 12f else 14f
         resultView.setTextColor(if (assistMode) C.DIM else C.BODY)
         questionView.text = if (assistMode) "等待面试官提问…" else "点击开始答题，面试官将提问"
@@ -542,7 +545,7 @@ class MainActivity : Activity() {
         assistMode = !assistMode
         Prefs.setMode(this, if (assistMode) Prefs.MODE_ASSIST else Prefs.MODE_PRACTICE)
         refreshModeUi()
-        log("切换模式: ${if (assistMode) "真人辅助" else "练习模式"}")
+        log("切换模式: ${if (assistMode) "实战模式" else "练习模式"}")
     }
 
     private fun refreshUploadCard() {
@@ -1153,7 +1156,9 @@ class MainActivity : Activity() {
         val idx = questionIdx
         val q = QUESTIONS[idx % QUESTIONS.size]
         lastQuestion = q
-        handler.post { questionView.text = "第${idx % QUESTIONS.size + 1}题：$q" }
+        roundNo++
+        askedCount++
+        handler.post { questionView.text = "第${roundNo}题：$q" }
         if (!ttsReady) {
             log("TTS 未就绪，题目仅显示不播报")
             return
@@ -1173,8 +1178,8 @@ class MainActivity : Activity() {
                 }
                 ttsEndMs = SystemClock.elapsedRealtime() - recordStartElapsed
                 log("TTS 播题完成 @${ttsEndMs}ms")
-                // 题目播完 → 生成博弈话术（真人辅助模式由转写里的提问触发）
-                scheduleStrategy(lastQuestion, 200)
+                // 练习模式：只提问，不自动生成/播报话术（答完再看参考）
+                log("TTS 播题结束（练习模式：等用户回答）")
             }
             override fun onError(utteranceId: String?) { log("TTS 错误: $utteranceId") }
             @Deprecated("Deprecated in Java")
@@ -1339,9 +1344,18 @@ class MainActivity : Activity() {
         setButtonRunning(true)
         // 前台服务保活：ColorOS 后台冻结会导致推流线程卡死
         try { startService(Intent(this, DiagService::class.java)) } catch (e: Exception) { log("前台服务启动失败: ${e.message}") }
-        // 练习模式：TTS 播题 + 录音同时进行；真人辅助模式：只收音，不播题
+        // 练习模式：TTS 播题 + 录音同时进行；实战模式：只收音，不播题
         initTtsIfNeeded()
-        if (!assistMode) handler.postDelayed({ speakQuestion() }, 600)
+        ttsStartMs = -1L
+        ttsEndMs = -1L
+        if (!assistMode) {
+            if (pendingNextQuestion != null) {
+                log("沿用已播报的下一题: $lastQuestion")
+                pendingNextQuestion = null
+            } else {
+                handler.postDelayed({ speakQuestion() }, 600)
+            }
+        }
 
         val url = buildXfUrl()
         log("连接讯飞 RTASR-LLM…（role_type=2 角色分离）")
@@ -1409,6 +1423,10 @@ class MainActivity : Activity() {
         handler.postDelayed({ generateFeedback() }, 800)
         // F5：六维复盘（并行，落库后可从复盘卡进入）
         handler.postDelayed({ generateReport() }, 1400)
+        // 练习模式：答完后生成「参考话术」供对照（不自动播报）
+        if (!assistMode) handler.postDelayed({ generateReferenceStrategy() }, 900)
+        // 练习模式：根据真实回答 + 资料，生成下一题（深挖或换题）并播报
+        if (!assistMode) handler.postDelayed({ generateNextQuestion() }, 2600)
     }
 
     // ---------- DeepSeek 面试反馈 ----------
@@ -1796,11 +1814,7 @@ class MainActivity : Activity() {
     private val speakTicker = object : Runnable {
         override fun run() {
             val sec = (SystemClock.elapsedRealtime() - speakStartAt) / 1000
-            speakStateView.text = String.format(Locale.US, "VOICE %02d / 05s", sec.coerceAtMost(5))
-            if (sec >= 5) {
-                handler.postDelayed({ speakStateView.text = "" }, 1000)
-                return
-            }
+            speakStateView.text = String.format(Locale.US, "VOICE %02ds", sec)
             handler.postDelayed(this, 200)
         }
     }
@@ -1848,7 +1862,8 @@ class MainActivity : Activity() {
             if (rag.isNotEmpty()) log("上传资料命中 ${rag.length} 字（问题: $q）")
             if (builtin.isNotEmpty()) log("内置知识库命中 ${builtin.length} 字（问题: $q）")
             if (history.isNotEmpty()) log("多轮上下文: 已有 ${Conversation.size()} 轮，注入 ${history.length} 字")
-            val advice = StrategyEngine.generate(q, tips, DEEPSEEK_API_KEY, history)
+            val advice = StrategyEngine.generate(q, tips, DEEPSEEK_API_KEY, history,
+                hasUserData = DocumentStore.list(this).isNotEmpty())
             handler.post {
                 if (job != strategyJob) return@post
                 if (advice.error.isNotEmpty()) {
@@ -1868,9 +1883,87 @@ class MainActivity : Activity() {
                     nextCard.visibility = View.VISIBLE
                 }
                 status(if (assistMode) "收音中" else "答题中")
-                if (Prefs.speakEnabled(this@MainActivity)) speakStrategy(advice.opening)
+                if (assistMode && Prefs.speakEnabled(this@MainActivity)) speakStrategy(advice.opening)
             }
         }.apply { isDaemon = true; name = "strategy-gen" }.start()
+    }
+
+    /** 练习模式：基于本轮真实回答 + 资料生成下一题（深挖或切换），并播报 */
+    private fun generateNextQuestion() {
+        val q = lastQuestion
+        val a = resultText()
+        log("生成下一题: 上一题=$q | 本轮回答 ${a.length} 字")
+        Thread {
+            val tips = DocumentStore.retrieve(this, a.ifBlank { q }) + BuiltinKnowledge.retrieve(this, q)
+            val nq = NextQuestionEngine.generate(q, a, Conversation.contextPrompt(), tips, DEEPSEEK_API_KEY, askedCount)
+            handler.post {
+                if (nq.error.isNotEmpty() || nq.text.isBlank()) {
+                    log("下一题生成失败: ${nq.error}")
+                    val fallback = QUESTIONS[questionIdx % QUESTIONS.size]
+                    askNextQuestion(fallback, "切换")
+                } else {
+                    log("下一题就绪: kind=${nq.kind} | ${nq.text}")
+                    askNextQuestion(nq.text, nq.kind)
+                }
+            }
+        }.apply { isDaemon = true; name = "next-question" }.start()
+    }
+
+    private fun askNextQuestion(text: String, kind: String) {
+        roundNo++
+        askedCount++
+        lastQuestion = text
+        pendingNextQuestion = text
+        val label = if (kind == "深挖") "追问" else "第${roundNo}题"
+        handler.post {
+            questionView.text = "$label：$text"
+            strategyView.text = if (assistMode) "听到提问后自动生成可直接说出口的话术并播报。"
+            else "回答后给出参考话术与下一题。"
+            nextCard.visibility = View.GONE
+            status("面试官提问完成，点「开始答题」回答")
+        }
+        speakInterviewer(text)
+    }
+
+    /** 面试官提问播报（与 TTS 播题共用同一个 tts 实例） */
+    private fun speakInterviewer(text: String) {
+        if (!ttsReady) {
+            log("TTS 未就绪，下一题仅显示")
+            return
+        }
+        val r = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "next_$roundNo")
+        log("播报下一题(返回=$r): $text")
+    }
+
+    /** 练习模式答完后生成参考话术（只上屏，不自动播报） */
+    private fun generateReferenceStrategy() {
+        val q = lastQuestion
+        if (q.isBlank()) return
+        log("生成参考话术（练习模式，不播报）: $q")
+        val t0 = SystemClock.elapsedRealtime()
+        Thread {
+            val rag = DocumentStore.retrieve(this, q)
+            val builtin = BuiltinKnowledge.retrieve(this, q)
+            val advice = StrategyEngine.generate(q, rag + builtin, DEEPSEEK_API_KEY,
+                Conversation.contextPrompt(), hasUserData = DocumentStore.list(this).isNotEmpty())
+            handler.post {
+                if (advice.error.isNotEmpty()) {
+                    log("参考话术生成失败: ${advice.error}")
+                    return@post
+                }
+                log("参考话术就绪: ${SystemClock.elapsedRealtime() - t0}ms | SAY=${advice.opening.take(60)}")
+                currentStrategy = advice.opening
+                val note = if (DocumentStore.list(this).isEmpty())
+                    "\n\n（参考话术：未上传项目资料，数字为示例口径，请换成本人真实数据；点「重新播报」可听）"
+                else "\n\n（参考话术，可点「重新播报」听）"
+                strategyView.text = "「${advice.opening}」" + note
+                renderChips(advice.opening)
+                if (advice.followup.isNotBlank()) {
+                    nextView.text = advice.followup
+                    nextCard.visibility = View.VISIBLE
+                }
+            }
+        }.apply { isDaemon = true; name = "ref-strategy" }.start()
     }
 
     private fun renderChips(content: String) {
