@@ -155,6 +155,7 @@ class MainActivity : Activity() {
     private var adviceSafety: Runnable? = null
     private var lastSpokenText = ""
     private var speechHoldUntil = 0L
+    private var lastSpeakAt = 0L
     private val recentInterviewer = ArrayList<Pair<String, Long>>()
     private val recentSpoken = ArrayList<Pair<String, Long>>()
     private val assistBuffer = StringBuilder()
@@ -214,7 +215,7 @@ class MainActivity : Activity() {
         // 不主动点亮屏幕/不覆盖锁屏，避免放裤兜时误触
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v3.3.0（锁屏/后台继续收音）")
+        log("应用启动 v3.4.0（防重复播报 · 音色可选 · 数字顺读）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         BuiltinKnowledge.ensureLoaded(this)
         try {
@@ -682,6 +683,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
 最近忽略原因：${lastIgnoreReason.ifBlank { "无" }}
 上次结束原因：${lastStopReason.ifBlank { "无" }}
 后台存活：前台服务 + 唤醒锁（锁屏继续收音）
+播报音色：${tts?.voice?.name ?: "未初始化"}　引擎：${tts?.defaultEngine ?: "-"}
 最近播报：${speakStateView.text}
 """.trim()
     }
@@ -1016,6 +1018,38 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         box.addView(entry("资料库 / 知识库（${DocumentStore.list(this).size} 份）") {
             dlgRef?.dismiss()
             openDocs()
+        })
+        box.addView(entry("播报音色（选你喜欢的）") {
+            log("点击播报音色入口")
+            val voices = try {
+                tts?.voices?.filter {
+                    val l = it.locale.toString().lowercase()
+                    l.contains("zh") || l.contains("chn") || l.contains("cmn") || l.contains("yue")
+                }?.toList().orEmpty()
+            } catch (e: Exception) {
+                log("读取音色失败: ${e.message}")
+                emptyList<android.speech.tts.Voice>()
+            }
+            val all = try { tts?.voices?.toList().orEmpty() } catch (e: Exception) { emptyList<android.speech.tts.Voice>() }
+            log("可用中文音色数量: ${voices.size}；全部音色 ${all.size} 个: " + all.take(12).joinToString { "${it.name}(${it.locale})" })
+            if (voices.isEmpty()) status("系统 TTS 未暴露中文音色，使用默认音色")
+            if (voices.isEmpty()) {
+                status("系统没有可用的中文音色")
+                return@entry
+            }
+            val names = voices.map { "${it.name}（${if (it.isNetworkConnectionRequired) "在线" else "本地"}）" }.toTypedArray()
+            AlertDialog.Builder(this)
+                .setTitle("选择播报音色")
+                .setItems(names) { _, which ->
+                    val v = voices[which]
+                    Prefs.setVoice(this, v.name)
+                    try { tts?.voice = v; tts?.setPitch(1.0f) } catch (_: Exception) {}
+                    log("音色已切换: ${v.name} (${v.locale})")
+                    status("音色已切换：${v.name}")
+                    speakInterviewer("这是新音色的试听，数字比如五十万、百分之八十七。")
+                }
+                .setNegativeButton("取消", null)
+                .show()
         })
         box.addView(entry("锁屏/后台运行设置") {
             AlertDialog.Builder(this)
@@ -1422,7 +1456,15 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                 if (status == TextToSpeech.SUCCESS) {
                     ttsReady = true
                     val lang = tts?.setLanguage(Locale.CHINA)
-                    tts?.setSpeechRate(1.1f) // 播报 24 字控制在 5 秒内
+                    tts?.setSpeechRate(1.1f) // 播报速度
+                    val savedVoice = Prefs.voice(this@MainActivity)
+                    if (savedVoice.isNotBlank()) {
+                        tts?.voices?.firstOrNull { it.name == savedVoice }?.let { v ->
+                            tts?.voice = v
+                            log("应用已保存音色: ${v.name} (${v.locale})")
+                        }
+                    }
+                    tts?.setPitch(1.0f)
                     log("TTS 初始化成功；setLanguage(zh_CN)=$lang")
                 } else {
                     log("TTS 初始化失败 status=$status（检查系统 TTS 引擎与语音包）")
@@ -1464,7 +1506,7 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
                     log("话术播报完成，用时 ${cost}ms")
                     adviceSpeaking = false
                     adviceSafety?.let { handler.removeCallbacks(it) }
-                    adviceCooldownUntil = SystemClock.elapsedRealtime() + 1500
+                    adviceCooldownUntil = SystemClock.elapsedRealtime() + 3000
                     handler.post { speakStateView.text = "" }
                     return
                 }
@@ -2229,6 +2271,11 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
             log("同一问题 30s 内已生成话术，跳过: $q")
             return
         }
+        // 8 秒内不重复回答（防止同一段提问被切分后连续触发两次播报）
+        if (now - lastStrategyAt < 8000 && q == lastStrategyQuestion) {
+            log("8s 内已对同一问题生成过，跳过: $q")
+            return
+        }
         lastStrategyQuestion = q
         lastStrategyAt = now
         val job = ++strategyJob
@@ -2423,6 +2470,10 @@ TTS 就绪：$ttsReady　自动播报：${if (Prefs.speakEnabled(this)) "开" el
         }
         val say = StrategyEngine.speechText(text)
         adviceSpeaking = true
+        lastSpeakAt = SystemClock.elapsedRealtime()
+        try { tts?.setPitch(1.0f) } catch (_: Exception) {}
+        try { tts?.setSpeechRate(1.05f) } catch (_: Exception) {}
+        log("播报音色: ${tts?.voice?.name} / engine=${tts?.defaultEngine}")
         lastSpokenText = say
         recentSpoken.add(say to SystemClock.elapsedRealtime())
         while (recentSpoken.size > 4) recentSpoken.removeAt(0)

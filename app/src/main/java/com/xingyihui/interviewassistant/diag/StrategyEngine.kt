@@ -200,7 +200,14 @@ SAY 必须使用可复用的行业口径主语（如「我们这类门店」「�
      * 实战模式需要「照着念」，完整性优先于 5 秒限制。
      */
     fun speechText(opening: String): String {
-        val one = clean(opening)
-        return if (one.length <= 80) one else one.take(80)
+        var t = clean(opening)
+        // 数字/单位读法顺滑：去空格、% → 百分之、比例冒号 → 比、顿号 → 逗号、括号去掉
+        t = t.replace(Regex("\\s+"), "")
+        t = t.replace("％", "百分之").replace("%", "百分之")
+        t = t.replace("：", "比").replace(":", "比")
+        t = t.replace("、", "，")
+        t = t.replace("（", "").replace("）", "").replace("(", "").replace(")", "")
+        t = t.replace("~", "到").replace("-", "到")
+        return if (t.length <= 90) t else t.take(90)
     }
 }

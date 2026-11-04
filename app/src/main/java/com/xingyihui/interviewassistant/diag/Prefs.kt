@@ -11,7 +11,8 @@ object Prefs {
 
     const val KEY_THRESHOLD = "filter_threshold"
     const val KEY_SPEAK = "speak_strategy"
-    const val KEY_MODE = "default_mode" // "practice" | "assist"
+    const val KEY_MODE = "default_mode"
+    const val KEY_VOICE = "tts_voice" // "practice" | "assist"
 
     const val MODE_PRACTICE = "practice"
     const val MODE_ASSIST = "assist"
@@ -32,6 +33,12 @@ object Prefs {
 
     fun setSpeakEnabled(ctx: Context, on: Boolean) {
         sp(ctx).edit().putBoolean(KEY_SPEAK, on).apply()
+    }
+
+    fun voice(ctx: Context): String = sp(ctx).getString(KEY_VOICE, "") ?: ""
+
+    fun setVoice(ctx: Context, name: String) {
+        sp(ctx).edit().putString(KEY_VOICE, name).apply()
     }
 
     fun mode(ctx: Context): String = sp(ctx).getString(KEY_MODE, MODE_PRACTICE) ?: MODE_PRACTICE
