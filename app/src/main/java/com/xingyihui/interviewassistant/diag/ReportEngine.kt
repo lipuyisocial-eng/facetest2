@@ -78,7 +78,7 @@ JSON 格式（六维固定为：内容完整度/数据可信度/逻辑自洽/表
             .build()
     }
 
-    fun generate(question: String, answer: String, apiKey: String): Report {
+    fun generate(question: String, answer: String, apiKey: String, history: String = ""): Report {
         if (answer.isBlank()) {
             return Report(
                 DIMS.map { Dim(it, 10, "本轮几乎没有有效回答（仅语气词或静音），无法评估。") },
@@ -94,7 +94,8 @@ JSON 格式（六维固定为：内容完整度/数据可信度/逻辑自洽/表
             put("messages", JSONArray().apply {
                 put(JSONObject().put("role", "system").put("content", SYSTEM.trim()))
                 put(JSONObject().put("role", "user").put("content",
-                    "面试问题：$question\n候选人的真实回答（转写原文）：$answer"))
+                    (if (history.isBlank()) "" else history.trim() + "\n\n") +
+                        "本轮面试问题：$question\n本轮候选人的真实回答（转写原文）：$answer"))
             })
         }.toString()
         val req = Request.Builder()

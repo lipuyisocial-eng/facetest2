@@ -152,6 +152,7 @@ class MainActivity : Activity() {
     private lateinit var waveView: WaveView
     private var assistMode = false
     private var lastReportId: String? = null
+    private var dlgRef: AlertDialog? = null
 
     // TTS 播题
     private var tts: TextToSpeech? = null
@@ -202,7 +203,7 @@ class MainActivity : Activity() {
         setTurnScreenOn(true)
         assistMode = Prefs.mode(this) == Prefs.MODE_ASSIST
         buildUi()
-        log("应用启动 v1.6.0（资料库 · 实时话术 · 六维复盘）")
+        log("应用启动 v1.7.0（多轮上下文 · 资料库 · 六维复盘）")
         log("设备: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} / Android ${android.os.Build.VERSION.RELEASE} (SDK ${android.os.Build.VERSION.SDK_INT})")
         loadCorpus()
         initTtsIfNeeded()   // 提前初始化：辅助模式/术语播报随时可用
@@ -246,12 +247,13 @@ class MainActivity : Activity() {
                     }
                 }.start()
             }
-            intent?.getStringExtra("debug_question")?.takeIf { it.isNotBlank() }?.let { q ->
-                handler.postDelayed({
-                    assistMode = true
-                    refreshModeUi()
-                    onDebugQuestion(q)
-                }, 1200)
+            intent?.getStringExtra("debug_question")?.takeIf { it.isNotBlank() }?.let { raw ->
+                val qs = raw.split("||").map { it.trim() }.filter { it.isNotEmpty() }
+                assistMode = true
+                refreshModeUi()
+                qs.forEachIndexed { i, q ->
+                    handler.postDelayed({ onDebugQuestion(q) }, 1200L + i * 12_000L)
+                }
             }
         }
     }
@@ -761,6 +763,37 @@ class MainActivity : Activity() {
         }
         box.addView(speakSwitch)
 
+        // F6：知识库 / 隐私 / 关于 分组入口
+        fun entry(title: String, onClick: () -> Unit): TextView = TextView(this).apply {
+            text = title
+            textSize = 14f
+            setTextColor(C.TEXT)
+            setPadding(0, dp(12), 0, dp(12))
+            setOnClickListener { onClick() }
+        }
+        box.addView(entry("资料库 / 知识库（${DocumentStore.list(this).size} 份）") {
+            dlgRef?.dismiss()
+            openDocs()
+        })
+        box.addView(entry("隐私说明") {
+            AlertDialog.Builder(this)
+                .setTitle("隐私说明")
+                .setMessage("· 录音、转写文本、资料解析结果、复盘报告只存在本机（应用私有目录），不上传除 DeepSeek / 讯飞转写以外的任何服务器。\n" +
+                    "· 讯飞实时转写会把音频实时发送到讯飞云用于识别；DeepSeek 只接收文字（问题、你的回答、资料检索片段）用于生成话术与复盘。\n" +
+                    "· 密钥通过 local.properties 注入，不进代码仓库；本应用无账号体系、无埋点。")
+                .setPositiveButton("知道了", null)
+                .show()
+        })
+        box.addView(entry("关于") {
+            AlertDialog.Builder(this)
+                .setTitle("面试博弈助手")
+                .setMessage("版本 ${BuildConfig.VERSION_NAME}（${BuildConfig.VERSION_CODE}）\n\n" +
+                    "练习模式：App 当面试官，练话术；真人辅助：听真人提问给提示。\n" +
+                    "话术与复盘由 DeepSeek 生成，转写由讯飞 rtasr_llm 提供。")
+                .setPositiveButton("好", null)
+                .show()
+        })
+
         val done = TextView(this).apply {
             text = "保存"
             textSize = 15f
@@ -773,6 +806,7 @@ class MainActivity : Activity() {
         box.addView(done)
 
         val dlg = AlertDialog.Builder(this).setView(box).create()
+        dlgRef = dlg
         done.setOnClickListener {
             val v = Prefs.MIN_THRESHOLD + (Prefs.MAX_THRESHOLD - Prefs.MIN_THRESHOLD) * seek.progress / 60f
             Prefs.setThreshold(this, v)
@@ -1162,6 +1196,7 @@ class MainActivity : Activity() {
         handler.post { resultView.text = resultPlaceholder }
         frameQueue.clear()
         status("准备中…")
+        Conversation.clear()
         setButtonRunning(true)
         // 前台服务保活：ColorOS 后台冻结会导致推流线程卡死
         try { startService(Intent(this, DiagService::class.java)) } catch (e: Exception) { log("前台服务启动失败: ${e.message}") }
@@ -1229,6 +1264,7 @@ class MainActivity : Activity() {
         status("转写结束")
         if (curSentence.isNotEmpty()) { commitSentence(curSentence, curBg, curEd); curSentence = "" }
         renderResult()
+        Conversation.recordAnswer(resultText())
         log("转写文本: ${committedText.length}字（过滤提问句 $droppedSentences 句）")
         // 基于转写结果生成面试反馈（独立线程；等 result 下行收敛后触发）
         handler.postDelayed({ generateFeedback() }, 800)
@@ -1425,7 +1461,7 @@ class MainActivity : Activity() {
         status("生成六维复盘…")
         log("开始生成复盘: 题目=$q | 回答${a.length}字")
         Thread {
-            val r = ReportEngine.generate(q, a, DEEPSEEK_API_KEY)
+            val r = ReportEngine.generate(q, a, DEEPSEEK_API_KEY, Conversation.reportContext())
             if (r.error.isNotEmpty()) {
                 handler.post {
                     log("复盘生成失败: ${r.error}")
@@ -1664,9 +1700,11 @@ class MainActivity : Activity() {
         Thread {
             val rag = DocumentStore.retrieve(this, q)
             val corpusTips = matchCorpus(q, "")
+            val history = Conversation.contextPrompt()
             val tips = rag + corpusTips
             if (rag.isNotEmpty()) log("资料库检索命中 ${rag.length} 字（问题: $q）")
-            val advice = StrategyEngine.generate(q, tips, DEEPSEEK_API_KEY)
+            if (history.isNotEmpty()) log("多轮上下文: 已有 ${Conversation.size()} 轮，注入 ${history.length} 字")
+            val advice = StrategyEngine.generate(q, tips, DEEPSEEK_API_KEY, history)
             handler.post {
                 if (job != strategyJob) return@post
                 if (advice.error.isNotEmpty()) {
@@ -1677,6 +1715,7 @@ class MainActivity : Activity() {
                 }
                 val total = SystemClock.elapsedRealtime() - t0
                 log("话术就绪: 模型${advice.elapsedMs}ms / 总${total}ms | SAY=${advice.opening} | NEXT=${advice.followup}")
+                Conversation.addAdvice(q, advice.opening)
                 currentStrategy = advice.opening
                 strategyView.text = "「${advice.opening}」"
                 renderChips(advice.opening)
@@ -1728,6 +1767,19 @@ class MainActivity : Activity() {
         log("播报话术(${say.length}字): $say")
         handler.removeCallbacks(speakTicker)
         handler.post(speakTicker)
+    }
+
+    /** 已在前台时再带 extra 拉起（adb am start -f 0x20000000）：直接驱动调试注入，便于连续多轮 */
+    @Deprecated("Deprecated in Java")
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (!BuildConfig.DEBUG) return
+        intent.getStringExtra("debug_question")?.takeIf { it.isNotBlank() }?.let { q ->
+            assistMode = true
+            refreshModeUi()
+            onDebugQuestion(q)
+        }
     }
 
     // ---------- 生命周期 ----------

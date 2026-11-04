@@ -57,8 +57,8 @@ NEXT: <预判追问与补强>
             .build()
     }
 
-    /** 阻塞调用，必须在工作线程执行 */
-    fun generate(question: String, tips: String, apiKey: String): Advice {
+    /** 阻塞调用，必须在工作线程执行；history 为本场已发生的对话（可空） */
+    fun generate(question: String, tips: String, apiKey: String, history: String = ""): Advice {
         val t0 = System.currentTimeMillis()
         val body = JSONObject().apply {
             put("model", MODEL)
@@ -66,7 +66,8 @@ NEXT: <预判追问与补强>
             put("max_tokens", 220)
             put("messages", JSONArray().apply {
                 put(JSONObject().put("role", "system").put("content", buildSystemPrompt(tips)))
-                put(JSONObject().put("role", "user").put("content", "面试官提问：$question"))
+                put(JSONObject().put("role", "user").put("content",
+                    (if (history.isBlank()) "" else history.trim() + "\n\n") + "面试官提问：$question"))
             })
         }.toString()
 
